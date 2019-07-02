@@ -2,13 +2,13 @@ import abc
 
 import requests.exceptions
 import six
+
 from ..backend_api import Session
 from ..backend_api.session import BatchRequest
-
-from ..config import config_obj
-from ..config.defs import LOG_LEVEL_ENV_VAR, API_ACCESS_KEY, API_SECRET_KEY
-from ..debugging import get_logger
 from ..backend_api.version import __version__
+from ..config import config_obj
+from ..config.defs import API_ACCESS_KEY, API_SECRET_KEY, LOG_LEVEL_ENV_VAR
+from ..debugging import get_logger
 from .session import SendError, SessionInterface
 
 
