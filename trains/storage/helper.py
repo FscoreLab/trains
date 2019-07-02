@@ -2,7 +2,6 @@ import getpass
 import json
 import os
 import threading
-from _socket import gethostname
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime
@@ -15,20 +14,23 @@ import botocore.client
 import numpy as np
 import requests
 import six
-from ..backend_api.utils import get_http_session_with_retry
-from ..backend_config.bucket_config import S3BucketConfigurations, GSBucketConfigurations
-from attr import attrs, attrib, asdict
+from attr import asdict, attrib, attrs
 from botocore.exceptions import ClientError
 from furl import furl
-from libcloud.common.types import ProviderError, LibcloudError
+from libcloud.common.types import LibcloudError, ProviderError
 from libcloud.storage.providers import get_driver
 from libcloud.storage.types import Provider
 from pathlib2 import Path
 from six import binary_type
-from six.moves.queue import Queue, Empty
+from six.moves.queue import Empty, Queue
 from six.moves.urllib.parse import urlparse
 from six.moves.urllib.request import url2pathname
 
+from _socket import gethostname
+
+from ..backend_api.utils import get_http_session_with_retry
+from ..backend_config.bucket_config import (GSBucketConfigurations,
+                                            S3BucketConfigurations)
 from ..config import config
 from ..debugging import get_logger
 from ..errors import UsageError
@@ -158,7 +160,14 @@ class StorageHelper(object):
     _async_upload_threads = set()
 
     # collect all bucket credentials that aren't empty (ignore entries with an empty key or secret)
-    _s3_configurations = S3BucketConfigurations.from_config(config.get('aws.s3', {}))
+    s3_conf = config.get('aws.s3', {})
+    if not s3_conf.get('key'):
+        s3_conf['key'] = os.getenv('AWS_ACCESS_KEY_ID')
+    if not s3_conf.get('secret'):
+        s3_conf['secret'] = os.getenv('AWS_SECRET_ACCESS_KEY')
+    if not s3_conf.get('region'):
+        s3_conf['region'] = os.getenv('AWS_REGION')
+    _s3_configurations = S3BucketConfigurations.from_config(s3_conf)
     _gs_configurations = GSBucketConfigurations.from_config(config.get('google.storage', {}))
 
     _path_substitutions = _PathSubstitutionRule.load_list_from_config()
@@ -538,7 +547,7 @@ class StorageHelper(object):
             container=self._container,
             object_name=object_name,
             extra=extra)
-        
+
         return dest_path
 
     def upload(self, src_path, dest_path=None, extra=None, async_enable=False, cb=None):
@@ -556,27 +565,27 @@ class StorageHelper(object):
     def list(self, prefix=None):
         """
         List entries in the helper base path.
-        
+
         Return a list of names inside this helper base path. The base path is
         determined at creation time and is specific for each storage medium.
         For Google Storage and S3 it is the bucket of the path.
         For local files it is the root directory.
-        
+
         This operation is not supported for http and https protocols.
-        
+
         :param prefix: If None, return the list as described above. If not, it
             must be a string - the path of a sub directory under the base path.
             the returned list will include only objects under that subdir.
-            
+
         :return: List of strings - the paths of all the objects in the storage base
             path under prefix. Listed relative to the base path.
-            
+
         """
-        
+
         if prefix:
             if prefix.startswith(self._base_url):
                 prefix = prefix[len(self.base_url):].lstrip("/")
-                
+
             try:
                 res = self._driver.list_container_objects(self._container, ex_prefix=prefix)
             except TypeError:
@@ -949,7 +958,7 @@ class StorageHelper(object):
                 cb(dest_path)
             except Exception as e:
                 self._log.warn("Exception on upload callback: %s" % str(e))
-        
+
         return dest_path
 
     def _get_object(self, path):
@@ -983,8 +992,8 @@ class _HttpDriver(object):
 
     def upload_object_via_stream(self, iterator, container, object_name, extra=None, **kwargs):
         url = object_name[:object_name.index('/')]
-        url_path = object_name[len(url)+1:]
-        res = container.session.post(container.name+url, files={url_path: iterator}, timeout=self.timeout)
+        url_path = object_name[len(url) + 1:]
+        res = container.session.post(container.name + url, files={url_path: iterator}, timeout=self.timeout)
         if res.status_code != requests.codes.ok:
             raise ValueError('Failed uploading object %s (%d): %s' % (object_name, res.status_code, res.text))
         return res
