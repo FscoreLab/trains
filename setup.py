@@ -3,12 +3,18 @@ TRAINS - Artificial Intelligence Version Control
 https://github.com/allegroai/trains
 """
 
+import os.path as osp
+
 from pathlib2 import Path
 # Always prefer setuptools over distutils
 from setuptools import find_packages, setup
 from six import exec_
 
 here = Path(__file__).resolve().parent
+print(here)
+
+# Get the long description from the README file
+long_description = (here / 'README.md').read_text()
 
 
 def read_version_string():
@@ -25,6 +31,7 @@ setup(
     name='trains',
     version=version,
     description='TRAINS - Auto-Magical Experiment Manager & Version Control for AI',
+    long_description=long_description,
     long_description_content_type='text/markdown',
     # The project's main homepage.
     url='https://github.com/allegroai/trains',
