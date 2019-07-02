@@ -214,7 +214,14 @@ class StorageHelper(object):
     _async_upload_threads = set()
 
     # collect all bucket credentials that aren't empty (ignore entries with an empty key or secret)
-    _s3_configurations = S3BucketConfigurations.from_config(config.get('aws.s3', {}))
+    s3_conf = config.get('aws.s3', {})
+    if not s3_conf.get('key'):
+        s3_conf['key'] = os.getenv('AWS_ACCESS_KEY_ID')
+    if not s3_conf.get('secret'):
+        s3_conf['secret'] = os.getenv('AWS_SECRET_ACCESS_KEY')
+    if not s3_conf.get('region'):
+        s3_conf['region'] = os.getenv('AWS_REGION')
+    _s3_configurations = S3BucketConfigurations.from_config(s3_conf)
     _gs_configurations = GSBucketConfigurations.from_config(config.get('google.storage', {}))
     _azure_configurations = AzureContainerConfigurations.from_config(config.get('azure.storage', {}))
 
