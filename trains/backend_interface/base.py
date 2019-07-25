@@ -5,10 +5,12 @@ import six
 
 from ..backend_api import Session
 from ..backend_api.session import BatchRequest
-from ..backend_api.version import __version__
+from ..backend_api.session.defs import ENV_ACCESS_KEY, ENV_SECRET_KEY
+
 from ..config import config_obj
-from ..config.defs import API_ACCESS_KEY, API_SECRET_KEY, LOG_LEVEL_ENV_VAR
+from ..config.defs import LOG_LEVEL_ENV_VAR
 from ..debugging import get_logger
+from ..backend_api.version import __version__
 from .session import SendError, SessionInterface
 
 
@@ -54,18 +56,22 @@ class InterfaceBase(SessionInterface):
                 if log:
                     log.error(error_msg)
 
-                if res.meta.result_code <= 500:
-                    # Proper backend error/bad status code - raise or return
-                    if raise_on_errors:
-                        raise SendError(res, error_msg)
-                    return res
-
             except requests.exceptions.BaseHTTPError as e:
-                log.error('failed sending %s: %s' % (str(req), str(e)))
+                res = None
+                log.error('Failed sending %s: %s' % (str(req), str(e)))
+            except Exception as e:
+                res = None
+                log.error('Failed sending %s: %s' % (str(req), str(e)))
 
-            # Infrastructure error
-            if log:
-                log.info('retrying request %s' % str(req))
+            if res and res.meta.result_code <= 500:
+                # Proper backend error/bad status code - raise or return
+                if raise_on_errors:
+                    raise SendError(res, error_msg)
+                return res
+
+            # # Infrastructure error
+            # if log:
+            #     log.info('retrying request %s' % str(req))
 
     def send(self, req, ignore_errors=False, raise_on_errors=True, async_enable=False):
         return self._send(session=self.session, req=req, ignore_errors=ignore_errors, raise_on_errors=raise_on_errors,
@@ -78,8 +84,8 @@ class InterfaceBase(SessionInterface):
                 initialize_logging=False,
                 client='sdk-%s' % __version__,
                 config=config_obj,
-                api_key=API_ACCESS_KEY.get(),
-                secret_key=API_SECRET_KEY.get(),
+                api_key=ENV_ACCESS_KEY.get(),
+                secret_key=ENV_SECRET_KEY.get(),
             )
         return InterfaceBase._default_session
 
@@ -134,7 +140,11 @@ class IdObjectBase(InterfaceBase):
     def reload(self):
         if not self.id:
             raise ValueError('Failed reloading %s: missing id' % type(self).__name__)
-        self._data = self._reload()
+        # noinspection PyBroadException
+        try:
+            self._data = self._reload()
+        except Exception:
+            pass
 
     @classmethod
     def normalize_id(cls, id):
