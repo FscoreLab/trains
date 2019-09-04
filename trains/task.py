@@ -597,6 +597,7 @@ class Task(_Task):
         Should only be called if you are absolutely sure there is no need for the Task.
         """
         self._at_exit()
+        self._at_exit_called = False
 
     def is_current_task(self):
         """
