@@ -1,5 +1,6 @@
 import atexit
 import os
+import re
 import signal
 import sys
 import threading
@@ -9,17 +10,18 @@ from collections import OrderedDict, Callable
 
 import psutil
 import six
+from pathlib2 import Path
 
+from .binding.joblib_bind import PatchedJoblib
 from .backend_api.services import tasks, projects
-from .backend_interface import TaskStatusEnum
+from .backend_api.session.session import Session
 from .backend_interface.model import Model as BackendModel
 from .backend_interface.task import Task as _Task
 from .backend_interface.task.args import _Arguments
-from .backend_interface.task.development.stop_signal import TaskStopSignal
 from .backend_interface.task.development.worker import DevWorker
 from .backend_interface.task.repo import ScriptInfo
 from .backend_interface.util import get_single_result, exact_match_regex, make_message
-from .config import config, PROC_MASTER_ID_ENV_VAR
+from .config import config, PROC_MASTER_ID_ENV_VAR, DEV_TASK_NO_REUSE
 from .config import running_remotely, get_remote_task_id
 from .config.cache import SessionCache
 from .debugging.log import LoggerRoot
@@ -27,14 +29,17 @@ from .errors import UsageError
 from .logger import Logger
 from .model import InputModel, OutputModel, ARCHIVED_TAG
 from .task_parameters import TaskParameters
+from .binding.artifacts import Artifacts
+from .binding.environ_bind import EnvironmentBind, PatchOsFork
 from .binding.absl_bind import PatchAbsl
 from .utilities.args import argparser_parseargs_called, get_argparser_last_args, \
     argparser_update_currenttask
 from .binding.frameworks.pytorch_bind import PatchPyTorchModelIO
 from .binding.frameworks.tensorflow_bind import PatchSummaryToEventTransformer, PatchTensorFlowEager, \
     PatchKerasModelIO, PatchTensorflowModelIO
-from .utilities.resource_monitor import ResourceMonitor
+from .binding.frameworks.xgboost_bind import PatchXGBoostModelIO
 from .binding.matplotlib_bind import PatchedMatplotlib
+from .utilities.resource_monitor import ResourceMonitor
 from .utilities.seed import make_deterministic
 
 NotSet = object()
@@ -61,11 +66,12 @@ class Task(_Task):
     **Usage: Task.init(...), Task.create() or Task.get_task(...)**
     """
 
-    TaskTypes = tasks.TaskTypeEnum
+    TaskTypes = _Task.TaskTypes
 
     __create_protection = object()
     __main_task = None
     __exit_hook = None
+    __forked_proc_main_pid = None
     __task_id_reuse_time_window_in_hours = float(config.get('development.task_reuse_time_window_in_hours', 24.0))
     __store_diff_on_train = config.get('development.store_uncommitted_code_diff_on_train', False)
     __detect_repo_async = config.get('development.vcs_repo_detect_async', False)
@@ -91,7 +97,7 @@ class Task(_Task):
         if private is not Task.__create_protection:
             raise UsageError(
                 'Task object cannot be instantiated externally, use Task.current_task() or Task.get_task(...)')
-        self._lock = threading.RLock()
+        self._repo_detect_lock = threading.RLock()
 
         super(Task, self).__init__(**kwargs)
         self._arguments = _Arguments(self)
@@ -99,14 +105,12 @@ class Task(_Task):
         self._last_input_model_id = None
         self._connected_output_model = None
         self._dev_worker = None
-        self._dev_stop_signal = None
-        self._dev_mode_periodic_flag = False
         self._connected_parameter_type = None
         self._detect_repo_async_thread = None
         self._resource_monitor = None
+        self._artifacts_manager = Artifacts(self)
         # register atexit, so that we mark the task as stopped
         self._at_exit_called = False
-        self.__register_at_exit(self._at_exit)
 
     @classmethod
     def current_task(cls):
@@ -118,15 +122,15 @@ class Task(_Task):
 
     @classmethod
     def init(
-        cls,
-        project_name=None,
-        task_name=None,
-        task_type=TaskTypes.training,
-        reuse_last_task_id=True,
-        output_uri=None,
-        auto_connect_arg_parser=True,
-        auto_connect_frameworks=True,
-        auto_resource_monitoring=True,
+            cls,
+            project_name=None,
+            task_name=None,
+            task_type=TaskTypes.training,
+            reuse_last_task_id=True,
+            output_uri=None,
+            auto_connect_arg_parser=True,
+            auto_connect_frameworks=True,
+            auto_resource_monitoring=True,
     ):
         """
         Return the Task object for the main execution task (task context).
@@ -134,9 +138,10 @@ class Task(_Task):
         :param project_name: project to create the task in (if project doesn't exist, it will be created)
         :param task_name: task name to be created (in development mode, not when running remotely)
         :param task_type: task type to be created (in development mode, not when running remotely)
-        :param reuse_last_task_id: start with the previously used task id (stored in the data cache folder). \
-            if False every time we call the function we create a new task with the same name \
-            Notice! The reused task will be reset. (when running remotely, the usual behaviour applies) \
+        :param reuse_last_task_id: start with the previously used task id (stored in the data cache folder).
+            if False every time we call the function we create a new task with the same name
+            Notice! The reused task will be reset. (when running remotely, the usual behaviour applies)
+            If reuse_last_task_id is of type string, it will assume this is the task_id to reuse!
             Note: A closed or published task will not be reused, and a new task will be created.
         :param output_uri: Default location for output models (currently support folder/S3/GS/ ).
             notice: sub-folders (task_id) is created in the destination folder for all outputs.
@@ -153,7 +158,7 @@ class Task(_Task):
             validate = [
                 ('project name', project_name, cls.__main_task.get_project_name()),
                 ('task name', task_name, cls.__main_task.name),
-                ('task type', task_type, cls.__main_task.task_type),
+                ('task type', str(task_type), str(cls.__main_task.task_type)),
             ]
 
             for field, default, current in validate:
@@ -168,12 +173,31 @@ class Task(_Task):
                     )
 
         if cls.__main_task is not None:
+            # if this is a subprocess, regardless of what the init was called for,
+            # we have to fix the main task hooks and stdout bindings
+            if cls.__forked_proc_main_pid != os.getpid() and PROC_MASTER_ID_ENV_VAR.get() != os.getpid():
+                # make sure we only do it once  per process
+                cls.__forked_proc_main_pid = os.getpid()
+                # make sure we do not wait for the repo detect thread
+                cls.__main_task._detect_repo_async_thread = None
+                # remove the logger from the previous process
+                logger = cls.__main_task.get_logger()
+                logger.set_flush_period(None)
+                # create a new logger (to catch stdout/err)
+                cls.__main_task._logger = None
+                cls.__main_task._reporter = None
+                cls.__main_task.get_logger()
+                # unregister signal hooks, they cause subprocess to hang
+                cls.__main_task.__register_at_exit(cls.__main_task._at_exit)
+                cls.__main_task.__register_at_exit(None, only_remove_signal_and_exception_hooks=True)
+
             if not running_remotely():
                 verify_defaults_match()
 
             return cls.__main_task
 
-        # check that we are not a child process, in that case do nothing
+        # check that we are not a child process, in that case do nothing.
+        # we should not get here unless this is Windows platform, all others support fork
         if PROC_MASTER_ID_ENV_VAR.get() and PROC_MASTER_ID_ENV_VAR.get() != os.getpid():
             class _TaskStub(object):
                 def __call__(self, *args, **kwargs):
@@ -214,41 +238,49 @@ class Task(_Task):
             raise
         else:
             Task.__main_task = task
-            # Patch argparse to be aware of the current task
-            argparser_update_currenttask(Task.__main_task)
+            # register the main task for at exit hooks (there should only be one)
+            task.__register_at_exit(task._at_exit)
+            # patch OS forking
+            PatchOsFork.patch_fork()
             if auto_connect_frameworks:
+                PatchedJoblib.update_current_task(task)
                 PatchedMatplotlib.update_current_task(Task.__main_task)
                 PatchAbsl.update_current_task(Task.__main_task)
                 PatchSummaryToEventTransformer.update_current_task(task)
-                # PatchModelCheckPointCallback.update_current_task(task)
                 PatchTensorFlowEager.update_current_task(task)
                 PatchKerasModelIO.update_current_task(task)
                 PatchTensorflowModelIO.update_current_task(task)
                 PatchPyTorchModelIO.update_current_task(task)
+                PatchXGBoostModelIO.update_current_task(task)
             if auto_resource_monitoring:
                 task._resource_monitor = ResourceMonitor(task)
                 task._resource_monitor.start()
-            # Check if parse args already called. If so, sync task parameters with parser
-            if argparser_parseargs_called():
-                parser, parsed_args = get_argparser_last_args()
-                task._connect_argparse(parser=parser, parsed_args=parsed_args)
 
             # make sure all random generators are initialized with new seed
             make_deterministic(task.get_random_seed())
 
             if auto_connect_arg_parser:
+                EnvironmentBind.update_current_task(Task.__main_task)
+
                 # Patch ArgParser to be aware of the current task
                 argparser_update_currenttask(Task.__main_task)
                 # Check if parse args already called. If so, sync task parameters with parser
                 if argparser_parseargs_called():
                     parser, parsed_args = get_argparser_last_args()
-                    task._connect_argparse(parser, parsed_args=parsed_args)
+                    task._connect_argparse(parser=parser, parsed_args=parsed_args)
 
         # Make sure we start the logger, it will patch the main logging object and pipe all output
         # if we are running locally and using development mode worker, we will pipe all stdout to logger.
         # The logger will automatically take care of all patching (we just need to make sure to initialize it)
-        task.get_logger()
-
+        logger = task.get_logger()
+        # show the debug metrics page in the log, it is very convenient
+        logger.console(
+            'TRAINS results page: {}/projects/{}/experiments/{}/output/log'.format(
+                task._get_app_server(),
+                task.project if task.project is not None else '*',
+                task.id,
+            ),
+        )
         # Make sure we start the dev worker if required, otherwise it will only be started when we write
         # something to the log.
         task._dev_mode_task_start()
@@ -257,10 +289,10 @@ class Task(_Task):
 
     @classmethod
     def create(
-        cls,
-        task_name=None,
-        project_name=None,
-        task_type=TaskTypes.training,
+            cls,
+            task_name=None,
+            project_name=None,
+            task_type=TaskTypes.training,
     ):
         """
         Create a new Task object, regardless of the main execution task (Task.init).
@@ -303,44 +335,46 @@ class Task(_Task):
         if task._dev_worker:
             task._dev_worker.unregister()
             task._dev_worker = None
-        if task._dev_stop_signal:
-            task._dev_stop_signal = None
 
     @classmethod
     def _create_dev_task(cls, default_project_name, default_task_name, default_task_type, reuse_last_task_id):
         if not default_project_name or not default_task_name:
             # get project name and task name from repository name and entry_point
-            result = ScriptInfo.get()
-            if result:
-                if not default_project_name:
-                    # noinspection PyBroadException
-                    try:
-                        parts = result.script['repository'].split('/')
-                        default_project_name = (parts[-1] or parts[-2]).replace('.git', '') or 'Untitled'
-                    except Exception:
-                        default_project_name = 'Untitled'
-                if not default_task_name:
-                    # noinspection PyBroadException
-                    try:
-                        default_task_name = os.path.splitext(os.path.basename(result.script['entry_point']))[0]
-                    except Exception:
-                        pass
+            result = ScriptInfo.get(create_requirements=False, check_uncommitted=False)
+            if not default_project_name:
+                # noinspection PyBroadException
+                try:
+                    parts = result.script['repository'].split('/')
+                    default_project_name = (parts[-1] or parts[-2]).replace('.git', '') or 'Untitled'
+                except Exception:
+                    default_project_name = 'Untitled'
+            if not default_task_name:
+                # noinspection PyBroadException
+                try:
+                    default_task_name = os.path.splitext(os.path.basename(result.script['entry_point']))[0]
+                except Exception:
+                    pass
 
-        # if we have a previous session to use, get the task id from it
-        default_task = cls.__get_last_used_task_id(
-            default_project_name,
-            default_task_name,
-            default_task_type.value,
-        )
+        # if we force no task reuse from os environment
+        if DEV_TASK_NO_REUSE.get() or not reuse_last_task_id:
+            default_task = None
+        else:
+            # if we have a previous session to use, get the task id from it
+            default_task = cls.__get_last_used_task_id(
+                default_project_name,
+                default_task_name,
+                default_task_type.value,
+            )
 
         closed_old_task = False
         default_task_id = None
-        in_dev_mode = not running_remotely() and not DevWorker.is_enabled()
+        in_dev_mode = not running_remotely()
 
         if in_dev_mode:
-            if not reuse_last_task_id or not cls.__task_is_relevant(default_task):
+            if isinstance(reuse_last_task_id, str) and reuse_last_task_id:
+                default_task_id = reuse_last_task_id
+            elif not reuse_last_task_id or not cls.__task_is_relevant(default_task):
                 default_task_id = None
-                closed_old_task = cls.__close_timed_out_task(default_task)
             else:
                 default_task_id = default_task.get('id') if default_task else None
 
@@ -351,7 +385,7 @@ class Task(_Task):
                         task_id=default_task_id,
                         log_to_backend=True,
                     )
-                    if ((task.status in (TaskStatusEnum.published, TaskStatusEnum.closed))
+                    if ((str(task.status) in (str(tasks.TaskStatusEnum.published), str(tasks.TaskStatusEnum.closed)))
                             or (ARCHIVED_TAG in task.data.tags) or task.output_model_id):
                         # If the task is published or closed, we shouldn't reset it so we can't use it in dev mode
                         # If the task is archived, or already has an output model,
@@ -361,6 +395,8 @@ class Task(_Task):
                     else:
                         # reset the task, so we can update it
                         task.reset(set_started_on_success=False, force=False)
+                        # set development tags
+                        task.set_tags([cls._development_tag])
                         # clear task parameters, they are not cleared by the Task reset
                         task.set_parameters({}, __update=False)
                         # clear the comment, it is not cleared on reset
@@ -388,6 +424,8 @@ class Task(_Task):
             # update this session, for later use
             cls.__update_last_used_task_id(default_project_name, default_task_name, default_task_type.value, task.id)
 
+        # mark the task as started
+        task.started()
         # force update of base logger to this current task (this is the main logger task)
         task._setup_log(replace_existing=True)
         logger = task.get_logger()
@@ -402,18 +440,11 @@ class Task(_Task):
         # update current repository and put warning into logs
         if in_dev_mode and cls.__detect_repo_async:
             task._detect_repo_async_thread = threading.Thread(target=task._update_repository)
+            task._detect_repo_async_thread.daemon = True
             task._detect_repo_async_thread.start()
         else:
             task._update_repository()
 
-        # show the debug metrics page in the log, it is very convenient
-        logger.console(
-            'TRAINS results page: {}/projects/{}/experiments/{}/output/log'.format(
-                task._get_app_server(),
-                task.project if task.project is not None else '*',
-                task.id,
-            ),
-        )
         # make sure everything is in sync
         task.reload()
         # make sure we see something in the UI
@@ -428,7 +459,7 @@ class Task(_Task):
         Returns Task object based on either, task_id (system uuid) or task name
 
         :param task_id: unique task id string (if exists other parameters are ignored)
-        :param project_name: project name (str) the task belogs to
+        :param project_name: project name (str) the task belongs to
         :param task_name: task name (str) in within the selected project
         :return: Task object
         """
@@ -440,7 +471,20 @@ class Task(_Task):
 
     @output_uri.setter
     def output_uri(self, value):
+        # check if we have the correct packages / configuration
+        if value and value != self.storage_uri:
+            from .storage.helper import StorageHelper
+            helper = StorageHelper.get(value)
+            helper.check_write_permissions()
         self.storage_uri = value
+
+    @property
+    def artifacts(self):
+        """
+        dictionary of Task artifacts (name, artifact)
+        :return: dict
+        """
+        return self._artifacts_manager.artifacts
 
     def set_comment(self, comment):
         """
@@ -554,17 +598,6 @@ class Task(_Task):
         :param wait_for_uploads: if True the flush will exit only after all outstanding uploads are completed
         :return: True
         """
-        self._dev_mode_periodic()
-
-        # wait for detection repo sync
-        if self._detect_repo_async_thread:
-            with self._lock:
-                if self._detect_repo_async_thread:
-                    try:
-                        self._detect_repo_async_thread.join()
-                        self._detect_repo_async_thread = None
-                    except Exception:
-                        pass
 
         # make sure model upload is done
         if BackendModel.get_num_results() > 0 and wait_for_uploads:
@@ -598,6 +631,20 @@ class Task(_Task):
         """
         self._at_exit()
         self._at_exit_called = False
+        # unregister atexit callbacks and signal hooks, if we are the main task
+        if self.is_main_task():
+            self.__register_at_exit(None)
+
+    def add_artifact(self, name, artifact):
+        """
+        Add artifact for the current Task, used mostly for Data Audition.
+        Currently supported artifacts object types: pandas.DataFrame
+        :param name: name of the artifacts. can override previous artifacts if name already exists
+        :type name: str
+        :param artifact: artifact object, supported artifacts object types: pandas.DataFrame
+        :type artifact: pandas.DataFrame
+        """
+        self._artifacts_manager.add_artifact(name=name, artifact=artifact)
 
     def is_current_task(self):
         """
@@ -655,7 +702,7 @@ class Task(_Task):
             If `config_text` is not None, `config_dict` must not be provided.
         """
         config_text = self.get_model_config_text()
-        return  OutputModel._text_to_config_dict(config_text)
+        return OutputModel._text_to_config_dict(config_text)
 
     def set_model_label_enumeration(self, enumeration=None):
         """
@@ -687,6 +734,26 @@ class Task(_Task):
         """
         self.data.last_iteration = int(last_iteration)
         self._edit(last_iteration=self.data.last_iteration)
+
+    @classmethod
+    def set_credentials(cls, host=None, key=None, secret=None):
+        """
+        Set new default TRAINS-server host and credentials
+        These configurations will be overridden by wither OS environment variables or trains.conf configuration file
+        Notice: credentials needs to be set prior to Task initialization
+        :param host: host url, example: host='http://localhost:8008'
+        :type  host: str
+        :param key: user key/secret pair, example: key='thisisakey123'
+        :type  key: str
+        :param secret: user key/secret pair, example: secret='thisisseceret123'
+        :type  secret: str
+        """
+        if host:
+            Session.default_host = host
+        if key:
+            Session.default_key = key
+        if secret:
+            Session.default_secret = secret
 
     def _connect_output_model(self, model):
         assert isinstance(model, OutputModel)
@@ -820,32 +887,17 @@ class Task(_Task):
             # Feature turned off
             return
 
-        # # ToDo: Add support for back-end, currently doing nothing
-        # script = self.data.script
-        # if script and script.requirements:
-        #     # We already have predefined requirements
-        #     return
-        #
-        # script = ScriptInfo.get(check_uncommitted=True).script or {}
-        # freeze = pip_freeze()
-        #
-        # requirements = {
-        #     "diff": script.get("diff", ""),
-        #     "pip": freeze
-        # }
-        #
-        # self.send(tasks.SetRequirementsRequest(task=self.id, requirements=requirements))
-        # self.reload()
         return
 
     def _dev_mode_task_start(self, model_updated=False):
         """ Called when we suspect the task has started running """
         self._dev_mode_setup_worker(model_updated=model_updated)
 
-        if TaskStopSignal.enabled and not self._dev_stop_signal:
-            self._dev_stop_signal = TaskStopSignal(task=self)
-
     def _dev_mode_stop_task(self, stop_reason):
+        # make sure we do not get called (by a daemon thread) after at_exit
+        if self._at_exit_called:
+            return
+
         self.get_logger().warn(
             "### TASK STOPPED - USER ABORTED - {} ###".format(
                 stop_reason.upper().replace('_', ' ')
@@ -887,23 +939,6 @@ class Task(_Task):
         else:
             parent.terminate()
 
-    def _dev_mode_periodic(self):
-        if self._dev_mode_periodic_flag or not self.is_main_task():
-            # Ensures we won't get into an infinite recursion since we might call self.flush() down the line
-            return
-        self._dev_mode_periodic_flag = True
-
-        try:
-            if self._dev_stop_signal:
-                stop_reason = self._dev_stop_signal.test()
-                if stop_reason and not self._at_exit_called:
-                    self._dev_mode_stop_task(stop_reason)
-
-            if self._dev_worker:
-                self._dev_worker.status_report()
-        finally:
-            self._dev_mode_periodic_flag = False
-
     def _dev_mode_setup_worker(self, model_updated=False):
         if running_remotely() or not self.is_main_task():
             return
@@ -911,58 +946,73 @@ class Task(_Task):
         if self._dev_worker:
             return self._dev_worker
 
-        if not DevWorker.is_enabled(model_updated):
-            return None
-
         self._dev_worker = DevWorker()
-        self._dev_worker.register()
+        self._dev_worker.register(self)
 
         logger = self.get_logger()
         flush_period = logger.get_flush_period()
         if not flush_period or flush_period > self._dev_worker.report_period:
             logger.set_flush_period(self._dev_worker.report_period)
 
-        # Remove 'development' tag
-        tags = self.get_tags()
-        try:
-            tags.remove('development')
-        except ValueError:
-            pass
-        else:
-            self.set_tags(tags)
+    def _wait_for_repo_detection(self, timeout=None):
+        # wait for detection repo sync
+        if self._detect_repo_async_thread:
+            with self._repo_detect_lock:
+                if self._detect_repo_async_thread:
+                    try:
+                        if self._detect_repo_async_thread.is_alive():
+                            self._detect_repo_async_thread.join(timeout=timeout)
+                        self._detect_repo_async_thread = None
+                    except Exception:
+                        pass
+
+    def _summary_artifacts(self):
+        # signal artifacts upload, and stop daemon
+        self._artifacts_manager.stop(wait=True)
+        # print artifacts summary
+        self.get_logger().console(self._artifacts_manager.summary)
 
     def _at_exit(self):
         """
         Will happen automatically once we exit code, i.e. atexit
         :return:
         """
+        # protect sub-process at_exit
         if self._at_exit_called:
             return
+
+        is_sub_process = PROC_MASTER_ID_ENV_VAR.get() and PROC_MASTER_ID_ENV_VAR.get() != os.getpid()
 
         # noinspection PyBroadException
         try:
             # from here do not get into watch dog
             self._at_exit_called = True
-            self._dev_stop_signal = None
-            self._dev_mode_periodic_flag = True
             wait_for_uploads = True
             # first thing mark task as stopped, so we will not end up with "running" on lost tasks
             # if we are running remotely, the daemon will take care of it
+            task_status = None
             if not running_remotely() and self.is_main_task():
-                # from here, do not check worker status
-                if self._dev_worker:
-                    self._dev_worker.unregister()
                 # check if we crashed, ot the signal is not interrupt (manual break)
+                task_status = ('stopped', )
                 if self.__exit_hook:
-                    if self.__exit_hook.exception is not None or \
-                            (not self.__exit_hook.remote_user_aborted and self.__exit_hook.signal not in (None, 2)):
-                        self.mark_failed(status_reason='Exception')
+                    if (self.__exit_hook.exception and not isinstance(self.__exit_hook.exception, KeyboardInterrupt)) \
+                            or (not self.__exit_hook.remote_user_aborted and self.__exit_hook.signal not in (None, 2)):
+                        task_status = ('failed', 'Exception')
                         wait_for_uploads = False
                     else:
-                        self.stopped()
                         wait_for_uploads = (self.__exit_hook.remote_user_aborted or self.__exit_hook.signal is None)
-                else:
-                    self.stopped()
+                        if not self.__exit_hook.remote_user_aborted and self.__exit_hook.signal is None and \
+                                not self.__exit_hook.exception:
+                            task_status = ('completed', )
+                        else:
+                            task_status = ('stopped', )
+
+            # wait for repository detection (if we didn't crash)
+            if not is_sub_process and wait_for_uploads:
+                # we should print summary here
+                self._summary_artifacts()
+                # make sure that if we crashed the thread we are not waiting forever
+                self._wait_for_repo_detection(timeout=10.)
 
             # wait for uploads
             print_done_waiting = False
@@ -972,13 +1022,32 @@ class Task(_Task):
             # from here, do not send log in background thread
             if wait_for_uploads:
                 self.flush(wait_for_uploads=True)
+                # wait until the reporter flush everything
+                self.reporter.stop()
                 if print_done_waiting:
                     self.log.info('Finished uploading')
             else:
                 self._logger._flush_stdout_handler()
+
+            if not is_sub_process:
+                # from here, do not check worker status
+                if self._dev_worker:
+                    self._dev_worker.unregister()
+
+                # change task status
+                if not task_status:
+                    pass
+                elif task_status[0] == 'failed':
+                    self.mark_failed(status_reason=task_status[1])
+                elif task_status[0] == 'completed':
+                    self.completed()
+                elif task_status[0] == 'stopped':
+                    self.stopped()
+
             # stop resource monitoring
             if self._resource_monitor:
                 self._resource_monitor.stop()
+
             self._logger.set_flush_period(None)
             # this is so in theory we can close a main task and start a new one
             Task.__main_task = None
@@ -987,7 +1056,7 @@ class Task(_Task):
             pass
 
     @classmethod
-    def __register_at_exit(cls, exit_callback):
+    def __register_at_exit(cls, exit_callback, only_remove_signal_and_exception_hooks=False):
         class ExitHooks(object):
             _orig_exit = None
             _orig_exc_handler = None
@@ -1009,7 +1078,20 @@ class Task(_Task):
                     except Exception:
                         pass
                 self._exit_callback = callback
-                atexit.register(self._exit_callback)
+                if callback:
+                    self.hook()
+                else:
+                    # un register int hook
+                    if self._orig_exc_handler:
+                        sys.excepthook = self._orig_exc_handler
+                        self._orig_exc_handler = None
+                    for s in self._org_handlers:
+                        # noinspection PyBroadException
+                        try:
+                            signal.signal(s, self._org_handlers[s])
+                        except Exception:
+                            pass
+                    self._org_handlers = {}
 
             def hook(self):
                 if self._orig_exit is None:
@@ -1018,20 +1100,23 @@ class Task(_Task):
                 if self._orig_exc_handler is None:
                     self._orig_exc_handler = sys.excepthook
                 sys.excepthook = self.exc_handler
-                atexit.register(self._exit_callback)
-                if sys.platform == 'win32':
-                    catch_signals = [signal.SIGINT, signal.SIGTERM, signal.SIGSEGV, signal.SIGABRT,
-                                     signal.SIGILL, signal.SIGFPE]
-                else:
-                    catch_signals = [signal.SIGINT, signal.SIGTERM, signal.SIGSEGV, signal.SIGABRT,
-                                     signal.SIGILL, signal.SIGFPE, signal.SIGQUIT]
-                for s in catch_signals:
-                    # noinspection PyBroadException
-                    try:
-                        self._org_handlers[s] = signal.getsignal(s)
-                        signal.signal(s, self.signal_handler)
-                    except Exception:
-                        pass
+                if self._exit_callback:
+                    atexit.register(self._exit_callback)
+
+                if self._org_handlers:
+                    if sys.platform == 'win32':
+                        catch_signals = [signal.SIGINT, signal.SIGTERM, signal.SIGSEGV, signal.SIGABRT,
+                                         signal.SIGILL, signal.SIGFPE]
+                    else:
+                        catch_signals = [signal.SIGINT, signal.SIGTERM, signal.SIGSEGV, signal.SIGABRT,
+                                         signal.SIGILL, signal.SIGFPE, signal.SIGQUIT]
+                    for s in catch_signals:
+                        # noinspection PyBroadException
+                        try:
+                            self._org_handlers[s] = signal.getsignal(s)
+                            signal.signal(s, self.signal_handler)
+                        except Exception:
+                            pass
 
             def exit(self, code=0):
                 self.exit_code = code
@@ -1086,6 +1171,22 @@ class Task(_Task):
                 # return handler result
                 return org_handler
 
+        # we only remove the signals since this will hang subprocesses
+        if only_remove_signal_and_exception_hooks:
+            if not cls.__exit_hook:
+                return
+            if cls.__exit_hook._orig_exc_handler:
+                sys.excepthook = cls.__exit_hook._orig_exc_handler
+                cls.__exit_hook._orig_exc_handler = None
+            for s in cls.__exit_hook._org_handlers:
+                # noinspection PyBroadException
+                try:
+                    signal.signal(s, cls.__exit_hook._org_handlers[s])
+                except Exception:
+                    pass
+            cls.__exit_hook._org_handlers = {}
+            return
+
         if cls.__exit_hook is None:
             # noinspection PyBroadException
             try:
@@ -1093,13 +1194,13 @@ class Task(_Task):
                 cls.__exit_hook.hook()
             except Exception:
                 cls.__exit_hook = None
-        elif cls.__main_task is None:
+        else:
             cls.__exit_hook.update_callback(exit_callback)
 
     @classmethod
     def __get_task(cls, task_id=None, project_name=None, task_name=None):
         if task_id:
-            return cls(private=cls.__create_protection, task_id=task_id)
+            return cls(private=cls.__create_protection, task_id=task_id, log_to_backend=False)
 
         res = cls._send(
             cls._get_default_session(),
@@ -1219,10 +1320,6 @@ class Task(_Task):
         if not task_data:
             return False
 
-        # in dev-worker mode, never reuse a task
-        if DevWorker.is_enabled():
-            return False
-
         if cls.__task_timed_out(task_data):
             return False
 
@@ -1252,8 +1349,9 @@ class Task(_Task):
             (task.type, 'type'),
         )
 
-        return all(server_data == task_data.get(task_data_key)
-                   for server_data, task_data_key in compares)
+        # compare after casting to string to avoid enum instance issues
+        # remember we might have replaced the api version by now, so enums are different
+        return all(str(server_data) == str(task_data.get(task_data_key)) for server_data, task_data_key in compares)
 
     @classmethod
     def __close_timed_out_task(cls, task_data):
@@ -1266,14 +1364,15 @@ class Task(_Task):
             return False
 
         stopped_statuses = (
-            tasks.TaskStatusEnum.stopped,
-            tasks.TaskStatusEnum.published,
-            tasks.TaskStatusEnum.publishing,
-            tasks.TaskStatusEnum.closed,
-            tasks.TaskStatusEnum.failed,
+            str(tasks.TaskStatusEnum.stopped),
+            str(tasks.TaskStatusEnum.published),
+            str(tasks.TaskStatusEnum.publishing),
+            str(tasks.TaskStatusEnum.closed),
+            str(tasks.TaskStatusEnum.failed),
+            str(tasks.TaskStatusEnum.completed),
         )
 
-        if task.status not in stopped_statuses:
+        if str(task.status) not in stopped_statuses:
             cls._send(
                 cls._get_default_session(),
                 tasks.StoppedRequest(

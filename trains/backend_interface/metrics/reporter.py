@@ -1,16 +1,18 @@
 import collections
 import json
 
-import cv2
 import six
+import numpy as np
+from threading import Thread, Event
 
 from ..base import InterfaceBase
 from ..setupuploadmixin import SetupUploadMixin
 from ...utilities.async_manager import AsyncManagerMixin
 from ...utilities.plotly_reporter import create_2d_histogram_plot, create_value_matrix, create_3d_surface, \
-    create_2d_scatter_series, create_3d_scatter_series, create_line_plot, plotly_scatter3d_layout_dict
+    create_2d_scatter_series, create_3d_scatter_series, create_line_plot, plotly_scatter3d_layout_dict, \
+    create_image_plot
 from ...utilities.py3_interop import AbstractContextManager
-from .events import ScalarEvent, VectorEvent, ImageEvent, PlotEvent, ImageEventNoUpload
+from .events import ScalarEvent, VectorEvent, ImageEvent, PlotEvent, ImageEventNoUpload, UploadEvent
 
 
 class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncManagerMixin):
@@ -46,6 +48,13 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         self._bucket_config = None
         self._storage_uri = None
         self._async_enable = async_enable
+        self._flush_frequency = 30.0
+        self._exit_flag = False
+        self._flush_event = Event()
+        self._flush_event.clear()
+        self._thread = Thread(target=self._daemon)
+        self._thread.daemon = True
+        self._thread.start()
 
     def _set_storage_uri(self, value):
         value = '/'.join(x for x in (value.rstrip('/'), self._metrics.storage_key_prefix) if x)
@@ -69,10 +78,19 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
     def async_enable(self, value):
         self._async_enable = bool(value)
 
+    def _daemon(self):
+        while not self._exit_flag:
+            self._flush_event.wait(self._flush_frequency)
+            self._flush_event.clear()
+            self._write()
+            # wait for all reports
+            if self.get_num_results() > 0:
+                self.wait_for_results()
+
     def _report(self, ev):
         self._events.append(ev)
         if len(self._events) >= self._flush_threshold:
-            self._write()
+            self.flush()
 
     def _write(self):
         if not self._events:
@@ -87,10 +105,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         """
         Flush cached reports to backend.
         """
-        self._write()
-        # wait for all reports
-        if self.get_num_results() > 0:
-            self.wait_for_results()
+        self._flush_event.set()
+
+    def stop(self):
+        self._exit_flag = True
+        self._flush_event.set()
+        self._thread.join()
 
     def report_scalar(self, title, series, value, iter):
         """
@@ -138,8 +158,15 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :param iter: Iteration number
         :type value: int
         """
+        try:
+            def default(o):
+                if isinstance(o, np.int64):
+                    return int(o)
+        except Exception:
+            default = None
+
         if isinstance(plot, dict):
-            plot = json.dumps(plot)
+            plot = json.dumps(plot, default=default)
         elif not isinstance(plot, six.string_types):
             raise ValueError('Plot should be a string or a dict')
         ev = PlotEvent(metric=self._normalize_name(title),
@@ -164,7 +191,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         self._report(ev)
 
     def report_image_and_upload(self, title, series, iter, path=None, matrix=None, upload_uri=None,
-                                max_image_history=None):
+                                max_image_history=None, delete_after_upload=False):
         """
         Report an image and upload its contents. Image is uploaded to a preconfigured bucket (see setup_upload()) with
          a key (filename) describing the task ID, title, series and iteration.
@@ -176,10 +203,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :type value: int
         :param path: A path to an image file. Required unless matrix is provided.
         :type path: str
-        :param matrix: A 3D numpy.ndarray object containing image data (BGR). Required unless filename is provided.
+        :param matrix: A 3D numpy.ndarray object containing image data (RGB). Required unless filename is provided.
         :type matrix: str
         :param max_image_history: maximum number of image to store per metric/variant combination
         use negative value for unlimited. default is set in global configuration (default=5)
+        :param delete_after_upload: if True, one the file was uploaded the local copy will be deleted
+        :type delete_after_upload: boolean
         """
         if not self._storage_uri and not upload_uri:
             raise ValueError('Upload configuration is required (use setup_upload())')
@@ -187,9 +216,8 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             raise ValueError('Expected only one of [filename, matrix]')
         kwargs = dict(metric=self._normalize_name(title),
                       variant=self._normalize_name(series), iter=iter, image_file_history_size=max_image_history)
-        if matrix is None:
-            matrix = cv2.imread(path)
-        ev = ImageEvent(image_data=matrix, upload_uri=upload_uri, **kwargs)
+        ev = ImageEvent(image_data=matrix, upload_uri=upload_uri, local_image_path=path,
+                        delete_after_upload=delete_after_upload, **kwargs)
         self._report(ev)
 
     def report_histogram(self, title, series, histogram, iter, labels=None, xlabels=None, comment=None):
@@ -436,6 +464,59 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             ztitle=ztitle,
             camera=camera,
             comment=comment,
+        )
+
+        return self.report_plot(
+            title=self._normalize_name(title),
+            series=self._normalize_name(series),
+            plot=plotly_dict,
+            iter=iter,
+        )
+
+    def report_image_plot_and_upload(self, title, series, iter, path=None, matrix=None,
+                                     upload_uri=None, max_image_history=None, delete_after_upload=False):
+        """
+        Report an image as plot and upload its contents.
+        Image is uploaded to a preconfigured bucket (see setup_upload()) with a key (filename)
+        describing the task ID, title, series and iteration.
+        Then a plotly object is created and registered, this plotly objects points to the uploaded image
+        :param title: Title (AKA metric)
+        :type title: str
+        :param series: Series (AKA variant)
+        :type series: str
+        :param iter: Iteration number
+        :type value: int
+        :param path: A path to an image file. Required unless matrix is provided.
+        :type path: str
+        :param matrix: A 3D numpy.ndarray object containing image data (RGB). Required unless filename is provided.
+        :type matrix: str
+        :param max_image_history: maximum number of image to store per metric/variant combination
+        use negative value for unlimited. default is set in global configuration (default=5)
+        :param delete_after_upload: if True, one the file was uploaded the local copy will be deleted
+        :type delete_after_upload: boolean
+        """
+        if not upload_uri and not self._storage_uri:
+            raise ValueError('Upload configuration is required (use setup_upload())')
+        if len([x for x in (path, matrix) if x is not None]) != 1:
+            raise ValueError('Expected only one of [filename, matrix]')
+        kwargs = dict(metric=self._normalize_name(title),
+                      variant=self._normalize_name(series), iter=iter, image_file_history_size=max_image_history)
+        ev = UploadEvent(image_data=matrix, upload_uri=upload_uri, local_image_path=path,
+                         delete_after_upload=delete_after_upload, **kwargs)
+        _, url = ev.get_target_full_upload_uri(upload_uri or self._storage_uri, self._metrics.storage_key_prefix)
+
+        # Hack: if the url doesn't start with http/s then the plotly will not be able to show it,
+        # then we put the link under images not plots
+        if not url.startswith('http'):
+            return self.report_image_and_upload(title=title, series=series, iter=iter, path=path, matrix=matrix,
+                                                upload_uri=upload_uri, max_image_history=max_image_history)
+
+        self._report(ev)
+        plotly_dict = create_image_plot(
+            image_src=url,
+            title=title + '/' + series,
+            width=matrix.shape[1] if matrix is not None else 640,
+            height=matrix.shape[0] if matrix is not None else 480,
         )
 
         return self.report_plot(

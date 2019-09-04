@@ -6,9 +6,6 @@ import os
 import sys
 from platform import system
 
-import colorama
-from ..config import config, get_log_redirect_level
-from coloredlogs import ColoredFormatter
 from pathlib2 import Path
 from six import BytesIO
 from tqdm import tqdm
@@ -34,11 +31,22 @@ class LoggerRoot(object):
     def _make_stream_handler(cls, level=None, stream=sys.stdout, colored=False):
         ch = logging.StreamHandler(stream=stream)
         ch.setLevel(level)
+        formatter = None
+
+        # if colored, try to import colorama & coloredlogs (by default, not in the requirements)
         if colored:
-            colorama.init()
-            formatter = ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        else:
+            try:
+                import colorama
+                from coloredlogs import ColoredFormatter
+                colorama.init()
+                formatter = ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            except ImportError:
+                colored = False
+
+        # if we don't need or failed getting colored formatter
+        if not colored or not formatter:
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
         ch.setFormatter(formatter)
         return ch
 
@@ -46,6 +54,9 @@ class LoggerRoot(object):
     def get_base_logger(cls, level=None, stream=sys.stdout, colored=False):
         if LoggerRoot.__base_logger:
             return LoggerRoot.__base_logger
+        # avoid nested imports
+        from ..config import get_log_redirect_level
+
         LoggerRoot.__base_logger = logging.getLogger('trains')
         level = level if level is not None else default_level
         LoggerRoot.__base_logger.setLevel(level)
@@ -143,6 +154,9 @@ def get_null_logger(name=None):
     """ Get a logger with a null handler """
     log = logging.getLogger(name if name else 'null')
     if not log.handlers:
+        # avoid nested imports
+        from ..config import config
+
         log.addHandler(logging.NullHandler())
         log.propagate = config.get("log.null_log_propagate", False)
     return log

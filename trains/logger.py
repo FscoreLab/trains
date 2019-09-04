@@ -12,7 +12,7 @@ from .backend_interface.task.development.worker import DevWorker
 from .backend_interface.task.log import TaskHandler
 from .storage import StorageHelper
 from .utilities.plotly_reporter import SeriesInfo
-from .backend_interface import TaskStatusEnum
+from .backend_api.services import tasks
 from .backend_interface.task import Task as _Task
 from .config import running_remotely, get_cache_dir
 
@@ -64,10 +64,10 @@ class Logger(object):
         """
         **Do not construct Logger manually!**
 
-        please use Task.get_logger()
+        please use Logger.current_logger()
         """
         assert isinstance(private_task, _Task), \
-            'Logger object cannot be instantiated externally, use Task.get_logger()'
+            'Logger object cannot be instantiated externally, use Logger.current_logger()'
         super(Logger, self).__init__()
         self._task = private_task
         self._default_upload_destination = None
@@ -81,22 +81,71 @@ class Logger(object):
             self._task_handler = TaskHandler(self._task.session, self._task.id, capacity=100)
             # noinspection PyBroadException
             try:
-                Logger._stdout_original_write = sys.stdout.write
+                if Logger._stdout_original_write is None:
+                    Logger._stdout_original_write = sys.stdout.write
                 # this will only work in python 3, guard it with try/catch
-                sys.stdout._original_write = sys.stdout.write
+                if not hasattr(sys.stdout, '_original_write'):
+                    sys.stdout._original_write = sys.stdout.write
                 sys.stdout.write = stdout__patched__write__
-                sys.stderr._original_write = sys.stderr.write
+                if not hasattr(sys.stderr, '_original_write'):
+                    sys.stderr._original_write = sys.stderr.write
                 sys.stderr.write = stderr__patched__write__
             except Exception:
                 pass
             sys.stdout = Logger._stdout_proxy
             sys.stderr = Logger._stderr_proxy
+            # patch the base streams of sys (this way colorama will keep its ANSI colors)
+            # noinspection PyBroadException
+            try:
+                sys.__stderr__ = sys.stderr
+            except Exception:
+                pass
+            # noinspection PyBroadException
+            try:
+                sys.__stdout__ = sys.stdout
+            except Exception:
+                pass
+
+            # now check if we have loguru and make it re-register the handlers
+            # because it sores internally the stream.write function, which we cant patch
+            # noinspection PyBroadException
+            try:
+                from loguru import logger
+                register_stderr = None
+                register_stdout = None
+                for k, v in logger._handlers.items():
+                    if v._name == '<stderr>':
+                        register_stderr = k
+                    elif v._name == '<stdout>':
+                        register_stderr = k
+                if register_stderr is not None:
+                    logger.remove(register_stderr)
+                    logger.add(sys.stderr)
+                if register_stdout is not None:
+                    logger.remove(register_stdout)
+                    logger.add(sys.stdout)
+            except Exception:
+                pass
+
         elif DevWorker.report_stdout and not running_remotely():
             self._task_handler = TaskHandler(self._task.session, self._task.id, capacity=100)
             if Logger._stdout_proxy:
                 Logger._stdout_proxy.connect(self)
             if Logger._stderr_proxy:
                 Logger._stderr_proxy.connect(self)
+
+    @classmethod
+    def current_logger(cls):
+        """
+        Return a logger object for the current task. Can be called from anywhere in the code
+
+        :return Singleton Logger object for the current running task
+        """
+        from .task import Task
+        task = Task.current_task()
+        if not task:
+            return None
+        return task.get_logger()
 
     def console(self, msg, level=logging.INFO, omit_console=False, *args, **kwargs):
         """
@@ -113,24 +162,28 @@ class Logger(object):
                                msg='Logger failed casting log level "%s" to integer' % str(level))
             level = logging.INFO
 
-        try:
-            record = self._task.log.makeRecord(
-                "console", level=level, fn='', lno=0, func='', msg=msg, args=args, exc_info=None
-            )
-            # find the task handler
-            if not self._task_handler:
-                self._task_handler = [h for h in LoggerRoot.get_base_logger().handlers if isinstance(h, TaskHandler)][0]
-            self._task_handler.emit(record)
-        except Exception:
-            self._task.log.log(level=logging.ERROR,
-                               msg='Logger failed sending log: [level %s]: "%s"' % (str(level), str(msg)))
+        if not running_remotely():
+            # noinspection PyBroadException
+            try:
+                record = self._task.log.makeRecord(
+                    "console", level=level, fn='', lno=0, func='', msg=msg, args=args, exc_info=None
+                )
+                # find the task handler that matches our task
+                if not self._task_handler:
+                    self._task_handler = [h for h in LoggerRoot.get_base_logger().handlers
+                                          if isinstance(h, TaskHandler) and h.task_id == self._task.id][0]
+                self._task_handler.emit(record)
+            except Exception:
+                LoggerRoot.get_base_logger().warning(msg='Logger failed sending log: [level %s]: "%s"'
+                                                         % (str(level), str(msg)))
 
         if not omit_console:
             # if we are here and we grabbed the stdout, we need to print the real thing
-            if DevWorker.report_stdout:
+            if DevWorker.report_stdout and not running_remotely():
+                # noinspection PyBroadException
                 try:
                     # make sure we are writing to the original stdout
-                    Logger._stdout_original_write(str(msg)+'\n')
+                    Logger._stdout_original_write(str(msg) + '\n')
                 except Exception:
                     pass
             else:
@@ -337,15 +390,15 @@ class Logger(object):
         """
         # check if multiple series
         multi_series = (
-            isinstance(scatter, list)
-            and (
-                isinstance(scatter[0], np.ndarray)
-                or (
-                     scatter[0]
-                     and isinstance(scatter[0], list)
-                     and isinstance(scatter[0][0], list)
+                isinstance(scatter, list)
+                and (
+                        isinstance(scatter[0], np.ndarray)
+                        or (
+                                scatter[0]
+                                and isinstance(scatter[0], list)
+                                and isinstance(scatter[0][0], list)
+                        )
                 )
-            )
         )
 
         if not multi_series:
@@ -424,7 +477,7 @@ class Logger(object):
         return self.report_confusion_matrix(title, series, matrix, iteration, xlabels=xlabels, ylabels=ylabels)
 
     def report_surface(self, title, series, matrix, iteration, xlabels=None, ylabels=None,
-                       xtitle=None, ytitle=None, camera=None, comment=None):
+                       xtitle=None, ytitle=None, ztitle=None, camera=None, comment=None):
         """
         Report a 3d surface (same data as heat-map matrix, only presented differently)
 
@@ -440,6 +493,7 @@ class Logger(object):
         :param ylabels: optional label per row of the matrix
         :param xtitle: optional x-axis title
         :param ytitle: optional y-axis title
+        :param ztitle: optional z-axis title
         :param camera: X,Y,Z camera position. def: (1,1,1)
         :param comment: comment underneath the title
         """
@@ -459,6 +513,7 @@ class Logger(object):
             ylabels=ylabels,
             xtitle=xtitle,
             ytitle=ytitle,
+            ztitle=ztitle,
             camera=camera,
             comment=comment,
         )
@@ -490,7 +545,8 @@ class Logger(object):
         )
 
     @_safe_names
-    def report_image_and_upload(self, title, series, iteration, path=None, matrix=None, max_image_history=None):
+    def report_image_and_upload(self, title, series, iteration, path=None, matrix=None, max_image_history=None,
+                                delete_after_upload=False):
         """
         Report an image and upload its contents.
 
@@ -510,6 +566,8 @@ class Logger(object):
         :param max_image_history: maximum number of image to store per metric/variant combination \
         use negative value for unlimited. default is set in global configuration (default=5)
         :type max_image_history: int
+        :param delete_after_upload: if True, one the file was uploaded the local copy will be deleted
+        :type delete_after_upload: boolean
         """
 
         # if task was not started, we have to start it
@@ -531,6 +589,99 @@ class Logger(object):
             iter=iteration,
             upload_uri=upload_uri,
             max_image_history=max_image_history,
+            delete_after_upload=delete_after_upload,
+        )
+
+    def report_image_plot_and_upload(self, title, series, iteration, path=None, matrix=None, max_image_history=None,
+                                     delete_after_upload=False):
+        """
+        Report an image, upload its contents, and present in plots section using plotly
+
+        Image is uploaded to a preconfigured bucket (see setup_upload()) with a key (filename)
+        describing the task ID, title, series and iteration.
+
+        :param title: Title (AKA metric)
+        :type title: str
+        :param series: Series (AKA variant)
+        :type series: str
+        :param iteration: Iteration number
+        :type iteration: int
+        :param path: A path to an image file. Required unless matrix is provided.
+        :type path: str
+        :param matrix: A 3D numpy.ndarray object containing image data (RGB). Required unless filename is provided.
+        :type matrix: str
+        :param max_image_history: maximum number of image to store per metric/variant combination \
+        use negative value for unlimited. default is set in global configuration (default=5)
+        :type max_image_history: int
+        :param delete_after_upload: if True, one the file was uploaded the local copy will be deleted
+        :type delete_after_upload: boolean
+        """
+
+        # if task was not started, we have to start it
+        self._start_task_if_needed()
+        upload_uri = self._default_upload_destination or self._task._get_default_report_storage_uri()
+        if not upload_uri:
+            upload_uri = Path(get_cache_dir()) / 'debug_images'
+            upload_uri.mkdir(parents=True, exist_ok=True)
+            # Verify that we can upload to this destination
+            upload_uri = str(upload_uri)
+            storage = StorageHelper.get(upload_uri)
+            upload_uri = storage.verify_upload(folder_uri=upload_uri)
+
+        self._task.reporter.report_image_plot_and_upload(
+            title=title,
+            series=series,
+            path=path,
+            matrix=matrix,
+            iter=iteration,
+            upload_uri=upload_uri,
+            max_image_history=max_image_history,
+            delete_after_upload=delete_after_upload,
+        )
+
+    def report_file_and_upload(self, title, series, iteration, path=None, max_file_history=None,
+                               delete_after_upload=False):
+        """
+        Upload a file and report it as link in the debug images section.
+
+        File is uploaded to a preconfigured storage (see setup_upload()) with a key (filename)
+        describing the task ID, title, series and iteration.
+
+        :param title: Title (AKA metric)
+        :type title: str
+        :param series: Series (AKA variant)
+        :type series: str
+        :param iteration: Iteration number
+        :type iteration: int
+        :param path: A path to file to be uploaded
+        :type path: str
+        :param max_file_history: maximum number of files to store per metric/variant combination \
+        use negative value for unlimited. default is set in global configuration (default=5)
+        :type max_file_history: int
+        :param delete_after_upload: if True, one the file was uploaded the local copy will be deleted
+        :type delete_after_upload: boolean
+        """
+
+        # if task was not started, we have to start it
+        self._start_task_if_needed()
+        upload_uri = self._default_upload_destination or self._task._get_default_report_storage_uri()
+        if not upload_uri:
+            upload_uri = Path(get_cache_dir()) / 'debug_images'
+            upload_uri.mkdir(parents=True, exist_ok=True)
+            # Verify that we can upload to this destination
+            upload_uri = str(upload_uri)
+            storage = StorageHelper.get(upload_uri)
+            upload_uri = storage.verify_upload(folder_uri=upload_uri)
+
+        self._task.reporter.report_image_and_upload(
+            title=title,
+            series=series,
+            path=path,
+            matrix=None,
+            iter=iteration,
+            upload_uri=upload_uri,
+            max_image_history=max_file_history,
+            delete_after_upload=delete_after_upload,
         )
 
     def set_default_upload_destination(self, uri):
@@ -594,18 +745,21 @@ class Logger(object):
     @classmethod
     def _remove_std_logger(self):
         if isinstance(sys.stdout, PrintPatchLogger):
+            # noinspection PyBroadException
             try:
                 sys.stdout.connect(None)
             except Exception:
                 pass
         if isinstance(sys.stderr, PrintPatchLogger):
+            # noinspection PyBroadException
             try:
                 sys.stderr.connect(None)
             except Exception:
                 pass
 
     def _start_task_if_needed(self):
-        if self._task._status == TaskStatusEnum.created:
+        # do not refresh the task status read from cached variable _status
+        if str(self._task._status) == str(tasks.TaskStatusEnum.created):
             self._task.mark_started()
 
         self._task._dev_mode_task_start()
@@ -668,7 +822,13 @@ class PrintPatchLogger(object):
 
             if cur_line:
                 with PrintPatchLogger.recursion_protect_lock:
-                    self._log.console(cur_line, level=self._log_level, omit_console=True)
+                    # noinspection PyBroadException
+                    try:
+                        if self._log:
+                            self._log.console(cur_line, level=self._log_level, omit_console=True)
+                    except Exception:
+                        # what can we do, nothing
+                        pass
         else:
             if hasattr(self._terminal, '_original_write'):
                 self._terminal._original_write(message)
@@ -676,8 +836,7 @@ class PrintPatchLogger(object):
                 self._terminal.write(message)
 
     def connect(self, logger):
-        if self._log:
-            self._log._flush_stdout_handler()
+        self._cur_line = ''
         self._log = logger
 
     def __getattr__(self, attr):

@@ -5,11 +5,6 @@ try:
     import numpy as np
 except Exception:
     np = None
-try:
-    import cv2
-except Exception:
-    cv2 = None
-
 
 def make_deterministic(seed=1337, cudnn_deterministic=False):
     """
@@ -40,12 +35,6 @@ def make_deterministic(seed=1337, cudnn_deterministic=False):
     if np is not None:
         np.random.seed(seed)
 
-    if cv2 is not None:
-        try:
-            cv2.setRNGSeed(seed)
-        except Exception:
-            pass
-
     if torch is not None:
         try:
             torch.manual_seed(seed)
@@ -64,13 +53,20 @@ def make_deterministic(seed=1337, cudnn_deterministic=False):
 
         if not eager_mode_bypass:
             try:
-                tf.set_random_seed(seed)
+                tf.compat.v1.set_random_seed(seed)
             except Exception:
-                pass
+                try:
+                    tf.set_random_seed(seed)
+                except Exception:
+                    pass
+
             try:
-                tf.random.set_random_seed(seed)
+                tf.compat.v1.random.set_random_seed(seed)
             except Exception:
-                pass
+                try:
+                    tf.random.set_random_seed(seed)
+                except Exception:
+                    pass
 
 
 make_deterministic()

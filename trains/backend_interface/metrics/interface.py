@@ -4,6 +4,8 @@ from threading import Lock
 from time import time
 
 from humanfriendly import format_timespan
+from pathlib2 import Path
+
 from ...backend_api.services import events as api_events
 from ..base import InterfaceBase
 from ...config import config
@@ -116,12 +118,7 @@ class Metrics(InterfaceBase):
             entry = ev.get_file_entry()
             kwargs = {}
             if entry:
-                e_storage_uri = entry.upload_uri or storage_uri
-                self._file_related_event_time = now
-                # if we have an entry (with or without a stream), we'll generate the URL and store it in the event
-                filename = entry.name
-                key = '/'.join(x for x in (self._storage_key_prefix, ev.metric, ev.variant, filename.strip('/')) if x)
-                url = '/'.join(x.strip('/') for x in (e_storage_uri, key))
+                key, url = ev.get_target_full_upload_uri(storage_uri, self.storage_key_prefix)
                 kwargs[entry.key_prop] = key
                 kwargs[entry.url_prop] = url
                 if not entry.stream:
@@ -155,12 +152,18 @@ class Metrics(InterfaceBase):
                     url = storage.upload_from_stream(e.stream, e.url)
                     e.event.update(url=url)
                 except Exception as exp:
-                    log.debug("Failed uploading to {} ({})".format(
+                    log.warning("Failed uploading to {} ({})".format(
                         upload_uri if upload_uri else "(Could not calculate upload uri)",
                         exp,
                     ))
 
                     e.set_exception(exp)
+                e.stream.close()
+                if e.delete_local_file:
+                    try:
+                        Path(e.delete_local_file).unlink()
+                    except Exception:
+                        pass
 
             res = file_upload_pool.map_async(upload, entries)
             res.wait()
@@ -185,8 +188,10 @@ class Metrics(InterfaceBase):
             ))
 
         if good_events:
-            batched_requests = [api_events.AddRequest(event=ev.get_api_event()) for ev in good_events]
-            req = api_events.AddBatchRequest(requests=batched_requests)
-            return self.send(req, raise_on_errors=False)
+            _events = [ev.get_api_event() for ev in good_events]
+            batched_requests = [api_events.AddRequest(event=ev) for ev in _events if ev]
+            if batched_requests:
+                req = api_events.AddBatchRequest(requests=batched_requests)
+                return self.send(req, raise_on_errors=False)
 
         return None

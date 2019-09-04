@@ -1,6 +1,5 @@
 import abc
 import os
-import re
 import tarfile
 import zipfile
 from tempfile import mkdtemp, mkstemp
@@ -16,7 +15,7 @@ from .debugging.log import get_logger
 from .storage import StorageHelper
 from .utilities.enum import Options
 from .backend_interface import Task as _Task
-from .backend_interface.model import Model as _Model, DummyModel as _DummyModel
+from .backend_interface.model import create_dummy_model, Model as _Model
 from .config import running_remotely, get_cache_dir
 
 ARCHIVED_TAG = "archived"
@@ -40,6 +39,7 @@ class Framework(Options):
     darknet = 'Darknet'
     paddlepaddle = 'PaddlePaddle'
     scikitlearn = 'ScikitLearn'
+    xgboost = 'XGBoost'
 
     __file_extensions_mapping = {
         '.pb': (tensorflow, tensorflowjs, onnx, ),
@@ -59,13 +59,13 @@ class Framework(Options):
         '.h5': (keras, ),
         '.hdf5': (keras, ),
         '.keras': (keras, ),
-        '.model': (mknet, cntk, ),
+        '.model': (mknet, cntk, xgboost),
         '-symbol.json': (mknet, ),
         '.cntk': (cntk, ),
         '.t7': (torch, ),
         '.cfg': (darknet, ),
         '__model__': (paddlepaddle, ),
-        '.pkl': (scikitlearn, keras, ),
+        '.pkl': (scikitlearn, keras, xgboost),
     }
 
     @classmethod
@@ -370,6 +370,8 @@ class InputModel(BaseModel):
         """
         config_text = cls._resolve_config(config_text=config_text, config_dict=config_dict)
         weights_url = StorageHelper.conform_url(weights_url)
+        if not weights_url:
+            raise ValueError("Please provide a valid weights_url parameter")
         result = _Model._get_default_session().send(models.GetAllRequest(
             uri=[weights_url],
             only_fields=["id", "name"],
@@ -643,7 +645,7 @@ class OutputModel(BaseModel):
 
         self._model_local_filename = None
         self._base_model = None
-        self._floating_data = _DummyModel(
+        self._floating_data = create_dummy_model(
             design=_Model._wrap_design(config_text),
             labels=label_enumeration or task.get_labels_enumeration(),
             name=name,

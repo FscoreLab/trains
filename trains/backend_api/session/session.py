@@ -2,22 +2,28 @@ import json as json_lib
 import sys
 import types
 from socket import gethostname
+from six.moves.urllib.parse import urlparse, urlunparse
 
+import jwt
 import requests
 import six
 from pyhocon import ConfigTree
 from requests.auth import HTTPBasicAuth
 
 from .callresult import CallResult
-from .defs import ENV_VERBOSE, ENV_HOST, ENV_ACCESS_KEY, ENV_SECRET_KEY
+from .defs import ENV_VERBOSE, ENV_HOST, ENV_ACCESS_KEY, ENV_SECRET_KEY, ENV_WEB_HOST, ENV_FILES_HOST
 from .request import Request, BatchRequest
 from .token_manager import TokenManager
 from ..config import load
-from ..utils import get_http_session_with_retry
-from ..version import __version__
+from ..utils import get_http_session_with_retry, urllib_log_warning_setup
+from ...version import __version__
 
 
 class LoginError(Exception):
+    pass
+
+
+class MaxRequestSizeError(Exception):
     pass
 
 
@@ -31,8 +37,17 @@ class Session(TokenManager):
 
     _async_status_code = 202
     _session_requests = 0
-    _session_initial_timeout = (1.0, 10)
-    _session_timeout = (5.0, None)
+    _session_initial_timeout = (3.0, 10.)
+    _session_timeout = (10.0, 300.)
+    _write_session_data_size = 15000
+    _write_session_timeout = (300.0, 300.)
+
+    api_version = '2.1'
+    default_host = "https://demoapi.trainsai.io"
+    default_web = "https://demoapp.trainsai.io"
+    default_files = "https://demofiles.trainsai.io"
+    default_key = "EGRTCO8JMSIGI6S39GTP43NFWXDQOW"
+    default_secret = "x!XTov_G-#vspE*Y(h$Anm&DIc5Ou-F)jsl$PdOyj5wG1&E!Z8"
 
     # TODO: add requests.codes.gateway_timeout once we support async commits
     _retry_codes = [
@@ -91,7 +106,7 @@ class Session(TokenManager):
         self._logger = logger
 
         self.__access_key = api_key or ENV_ACCESS_KEY.get(
-            default=self.config.get("api.credentials.access_key", None)
+            default=(self.config.get("api.credentials.access_key", None) or self.default_key)
         )
         if not self.access_key:
             raise ValueError(
@@ -99,14 +114,14 @@ class Session(TokenManager):
             )
 
         self.__secret_key = secret_key or ENV_SECRET_KEY.get(
-            default=self.config.get("api.credentials.secret_key", None)
+            default=(self.config.get("api.credentials.secret_key", None) or self.default_secret)
         )
         if not self.secret_key:
             raise ValueError(
                 "Missing secret_key. Please set in configuration file or pass in session init."
             )
 
-        host = host or ENV_HOST.get(default=self.config.get("api.host"))
+        host = host or self.get_api_server_host(config=self.config)
         if not host:
             raise ValueError("host is required in init or config")
 
@@ -119,13 +134,29 @@ class Session(TokenManager):
 
         self.__worker = worker or gethostname()
 
-        self.__max_req_size = self.config.get("api.http.max_req_size")
+        self.__max_req_size = self.config.get("api.http.max_req_size", None)
         if not self.__max_req_size:
             raise ValueError("missing max request size")
 
         self.client = client or "api-{}".format(__version__)
 
         self.refresh_token()
+
+        # update api version from server response
+        try:
+            token_dict = jwt.decode(self.token, verify=False)
+            api_version = token_dict.get('api_version')
+            if not api_version:
+                api_version = '2.2' if token_dict.get('env', '') == 'prod' else Session.api_version
+
+            Session.api_version = str(api_version)
+        except (jwt.DecodeError, ValueError):
+            pass
+
+        # now setup the session reporting, so one consecutive retries will show warning
+        # we do that here, so if we have problems authenticating, we see them immediately
+        # notice: this is across the board warning omission
+        urllib_log_warning_setup(total_retries=http_retries_config.get('total', 0), display_warning_after=3)
 
     def _send_request(
         self,
@@ -160,10 +191,15 @@ class Session(TokenManager):
             else "{host}/{service}.{action}"
         ).format(**locals())
         while True:
+            if data and len(data) > self._write_session_data_size:
+                timeout = self._write_session_timeout
+            elif self._session_requests < 1:
+                timeout = self._session_initial_timeout
+            else:
+                timeout = self._session_timeout
             res = self.__http_session.request(
-                method, url, headers=headers, auth=auth, data=data, json=json,
-                timeout=self._session_initial_timeout if self._session_requests < 1 else self._session_timeout,
-            )
+                method, url, headers=headers, auth=auth, data=data, json=json, timeout=timeout)
+
             if (
                 refresh_token_if_unauthorized
                 and res.status_code == requests.codes.unauthorized
@@ -189,6 +225,10 @@ class Session(TokenManager):
         self._session_requests += 1
         return res
 
+    def add_auth_headers(self, headers):
+        headers[self._AUTHORIZATION_HEADER] = "Bearer {}".format(self.token)
+        return headers
+
     def send_request(
         self,
         service,
@@ -213,8 +253,9 @@ class Session(TokenManager):
         :param async_enable: whether request is asynchronous
         :return: requests Response instance
         """
-        headers = headers.copy() if headers else {}
-        headers[self._AUTHORIZATION_HEADER] = "Bearer {}".format(self.token)
+        headers = self.add_auth_headers(
+            headers.copy() if headers else {}
+        )
         if async_enable:
             headers[self._ASYNC_HEADER] = "1"
         return self._send_request(
@@ -273,7 +314,7 @@ class Session(TokenManager):
         results = []
         while True:
             size = self.__max_req_size
-            slice = req_data[cur : cur + size]
+            slice = req_data[cur: cur + size]
             if not slice:
                 break
             if len(slice) < size:
@@ -283,7 +324,10 @@ class Session(TokenManager):
                 # search for the last newline in order to send a coherent request
                 size = slice.rfind("\n") + 1
                 # readjust the slice
-                slice = req_data[cur : cur + size]
+                slice = req_data[cur: cur + size]
+                if not slice:
+                    raise MaxRequestSizeError('Error: {}.{} request exceeds limit {} > {} bytes'.format(
+                        service, action, len(req_data), self.__max_req_size))
             res = self.send_request(
                 method=method,
                 service=service,
@@ -376,6 +420,71 @@ class Session(TokenManager):
 
         return call_result
 
+    @classmethod
+    def get_api_server_host(cls, config=None):
+        if not config:
+            from ...config import config_obj
+            config = config_obj
+        return ENV_HOST.get(default=(config.get("api.api_server", None) or
+                                     config.get("api.host", None) or cls.default_host))
+
+    @classmethod
+    def get_app_server_host(cls, config=None):
+        if not config:
+            from ...config import config_obj
+            config = config_obj
+
+        # get from config/environment
+        web_host = ENV_WEB_HOST.get(default=config.get("api.web_server", None))
+        if web_host:
+            return web_host
+
+        # return default
+        host = cls.get_api_server_host(config)
+        if host == cls.default_host:
+            return cls.default_web
+
+        # compose ourselves
+        if '://demoapi.' in host:
+            return host.replace('://demoapi.', '://demoapp.', 1)
+        if '://api.' in host:
+            return host.replace('://api.', '://app.', 1)
+
+        parsed = urlparse(host)
+        if parsed.port == 8008:
+            return host.replace(':8008', ':8080', 1)
+
+        raise ValueError('Could not detect TRAINS web application server')
+
+    @classmethod
+    def get_files_server_host(cls, config=None):
+        if not config:
+            from ...config import config_obj
+            config = config_obj
+        # get from config/environment
+        files_host = ENV_FILES_HOST.get(default=(config.get("api.files_server", None)))
+        if files_host:
+            return files_host
+
+        # return default
+        host = cls.get_api_server_host(config)
+        if host == cls.default_host:
+            return cls.default_files
+
+        # compose ourselves
+        app_host = cls.get_app_server_host(config)
+        parsed = urlparse(app_host)
+        if parsed.port:
+            parsed = parsed._replace(netloc=parsed.netloc.replace(':%d' % parsed.port, ':8081', 1))
+        elif parsed.netloc.startswith('demoapp.'):
+            parsed = parsed._replace(netloc=parsed.netloc.replace('demoapp.', 'demofiles.', 1))
+        elif parsed.netloc.startswith('app.'):
+            parsed = parsed._replace(netloc=parsed.netloc.replace('app.', 'files.', 1))
+        else:
+            parsed = parsed._replace(netloc=parsed.netloc + ':8081')
+
+        return urlunparse(parsed)
+
     def _do_refresh_token(self, old_token, exp=None):
         """ TokenManager abstract method implementation.
             Here we ignore the old token and simply obtain a new token.
@@ -389,6 +498,7 @@ class Session(TokenManager):
             )
 
         auth = HTTPBasicAuth(self.access_key, self.secret_key)
+        res = None
         try:
             data = {"expiration_sec": exp} if exp else {}
             res = self._send_request(
@@ -414,8 +524,16 @@ class Session(TokenManager):
             return resp["data"]["token"]
         except LoginError:
             six.reraise(*sys.exc_info())
+        except KeyError as ex:
+            # check if this is a misconfigured api server (getting 200 without the data section)
+            if res and res.status_code == 200:
+                raise ValueError('It seems *api_server* is misconfigured. '
+                                 'Is this the TRAINS API server {} ?'.format(self.get_api_server_host()))
+            else:
+                raise LoginError("Response data mismatch: No 'token' in 'data' value from res, receive : {}, "
+                                 "exception: {}".format(res, ex))
         except Exception as ex:
-            raise LoginError(str(ex))
+            raise LoginError('Unrecognized Authentication Error: {} {}'.format(type(ex), ex))
 
     def __str__(self):
         return "{self.__class__.__name__}[{self.host}, {self.access_key}/{secret_key}]".format(

@@ -4,7 +4,6 @@ import sys
 
 import requests
 from requests.adapters import HTTPAdapter
-## from requests.packages.urllib3.util.retry import Retry
 from urllib3.util import Retry
 from urllib3 import PoolManager
 import six
@@ -25,6 +24,29 @@ __disable_certificate_verification_warning = 0
 def get_config():
     from ..config import config_obj
     return config_obj
+
+
+def urllib_log_warning_setup(total_retries=10, display_warning_after=5):
+    class RetryFilter(logging.Filter):
+        last_instance = None
+
+        def __init__(self, total, warning_after=5):
+            super(RetryFilter, self).__init__()
+            self.total = total
+            self.display_warning_after = warning_after
+            self.last_instance = self
+
+        def filter(self, record):
+            if record.args and len(record.args) > 0 and isinstance(record.args[0], Retry):
+                retry_left = self.total - record.args[0].total
+                return retry_left >= self.display_warning_after
+
+            return True
+
+    urllib3_log = logging.getLogger('urllib3.connectionpool')
+    if urllib3_log:
+        urllib3_log.removeFilter(RetryFilter.last_instance)
+        urllib3_log.addFilter(RetryFilter(total_retries, display_warning_after))
 
 
 class TLSv1HTTPAdapter(HTTPAdapter):
@@ -77,7 +99,7 @@ def get_http_session_with_retry(
     adapter = TLSv1HTTPAdapter(max_retries=retry, pool_connections=pool_connections, pool_maxsize=pool_maxsize)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
-    # update verify host certiface
+    # update verify host certificate
     session.verify = ENV_HOST_VERIFY_CERT.get(default=get_config().get('api.verify_certificate', True))
     if not session.verify and __disable_certificate_verification_warning < 2:
         # show warning

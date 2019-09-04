@@ -1,8 +1,9 @@
 from __future__ import absolute_import, division, print_function
 
 import collections
-import itertools
 import re
+import threading
+
 import requests
 import six
 if six.PY3:
@@ -23,6 +24,9 @@ _Version = collections.namedtuple(
 
 
 class _BaseVersion(object):
+    def __init__(self, key):
+        self._key = key
+
     def __hash__(self):
         return hash(self._key)
 
@@ -104,7 +108,7 @@ class Version(_BaseVersion):
         )
 
         # Generate a key which will be used for sorting
-        self._key = self._cmpkey(
+        key = self._cmpkey(
             self._version.epoch,
             self._version.release,
             self._version.pre,
@@ -112,6 +116,8 @@ class Version(_BaseVersion):
             self._version.dev,
             self._version.local,
         )
+
+        super(Version, self).__init__(key)
 
     def __repr__(self):
         return "<Version({0})>".format(repr(str(self)))
@@ -308,14 +314,19 @@ class CheckPackageUpdates(object):
         # noinspection PyBroadException
         try:
             cls._package_version_checked = True
-            releases = requests.get('https://pypi.python.org/pypi/trains/json').json()['releases'].keys()
+            # Sending the request only for statistics
+            update_statistics = threading.Thread(target=CheckPackageUpdates.get_version_from_updates_server)
+            update_statistics.daemon = True
+            update_statistics.start()
+
+            releases = requests.get('https://pypi.python.org/pypi/trains/json', timeout=3.0).json()['releases'].keys()
 
             releases = [Version(r) for r in releases]
             latest_version = sorted(releases)
             from ..version import __version__
             cur_version = Version(__version__)
             if not cur_version.is_devrelease and not cur_version.is_prerelease:
-                latest_version = [r for r in latest_version if not r.is_devrelease or not r.is_prerelease]
+                latest_version = [r for r in latest_version if not r.is_devrelease and not r.is_prerelease]
 
             if cur_version >= latest_version[-1]:
                 return None
@@ -323,3 +334,10 @@ class CheckPackageUpdates(object):
             return str(latest_version[-1]), not_patch_upgrade
         except Exception:
             return None
+
+    @staticmethod
+    def get_version_from_updates_server():
+        try:
+            _ = requests.get('https://updates.trainsai.io/updates', timeout=1.0)
+        except Exception:
+            pass
