@@ -6,6 +6,7 @@ from enum import Enum
 from threading import RLock, Thread
 
 import six
+from six.moves.urllib.parse import quote
 
 from ...backend_interface.task.development.worker import DevWorker
 from ...backend_api import Session
@@ -95,6 +96,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         else:
             # this is an existing task, let's try to verify stuff
             self._validate()
+
+        self._project_name = (self.project, project_name)
 
         if running_remotely() or DevWorker.report_stdout:
             log_to_backend = False
@@ -223,25 +226,26 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             project_id = get_or_create_project(self, project_name, created_msg)
 
         tags = [self._development_tag] if not running_remotely() else []
-
+        extra_properties = {'system_tags': tags} if Session.check_min_api_version('2.3') else {'tags': tags}
         req = tasks.CreateRequest(
             name=task_name or make_message('Anonymous task (%(user)s@%(host)s %(time)s)'),
             type=tasks.TaskTypeEnum(task_type.value),
             comment=created_msg,
             project=project_id,
             input={'view': {}},
-            tags=tags,
+            **extra_properties
         )
         res = self.send(req)
 
         return res.response.id
 
     def _set_storage_uri(self, value):
-        value = value.rstrip('/')
+        value = value.rstrip('/') if value else None
         self._storage_uri = StorageHelper.conform_url(value)
         self.data.output.destination = self._storage_uri
-        self._edit(output_dest=self._storage_uri)
-        self.output_model.upload_storage_uri = self._storage_uri
+        self._edit(output_dest=self._storage_uri or '')
+        if self._storage_uri or self._output_model:
+            self.output_model.upload_storage_uri = self._storage_uri
 
     @property
     def storage_uri(self):
@@ -369,7 +373,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return self._reporter
 
     def _get_output_destination_suffix(self, extra_path=None):
-        return '/'.join(x for x in ('task_%s' % self.data.id, extra_path) if x)
+        return '/'.join(quote(x, safe='[]{}()$^,.; -_+-=') for x in
+                        (self.get_project_name(), '%s.%s' % (self.name, self.data.id), extra_path) if x)
 
     def _reload(self):
         """ Reload the task object from the backend """
@@ -427,9 +432,10 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def update_output_model(self, model_uri, name=None, comment=None, tags=None):
         """
         Update the task's output model.
-         Note that this method only updates the model's metadata using the API and does not upload any data. Use this
-         method to update the output model when you have a local model URI (e.g. storing the weights file locally and
-         providing a file://path/to/file URI)
+        Note that this method only updates the model's metadata using the API and does not upload any data. Use this
+        method to update the output model when you have a local model URI (e.g. storing the weights file locally and
+        providing a file://path/to/file URI)
+
         :param model_uri: URI for the updated model weights file
         :type model_uri: str
         :param name: Optional updated model name
@@ -446,8 +452,9 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             self, model_file, name=None, comment=None, tags=None, async_enable=False, cb=None, iteration=None):
         """
         Update the task's output model weights file. File is first uploaded to the preconfigured output destination (see
-         task's output.destination property or call setup_upload()), than the model object associated with the task is
-         updated using an API call with the URI of the uploaded file (and other values provided by additional arguments)
+        task's output.destination property or call setup_upload()), than the model object associated with the task is
+        updated using an API call with the URI of the uploaded file (and other values provided by additional arguments)
+
         :param model_file: Path to the updated model weights file
         :type model_file: str
         :param name: Optional updated model name
@@ -493,6 +500,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def set_input_model(self, model_id=None, model_name=None, update_task_design=True, update_task_labels=True):
         """
         Set a new input model for this task. Model must be 'ready' in order to be used as the Task's input model.
+
         :param model_id: ID for a model that exists in the backend. Required if model_name is not provided.
         :param model_name: Model name. Required if model_id is not provided. If provided, this name will be used to
             locate an existing model in the backend.
@@ -511,7 +519,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                     page=0,
                     page_size=10,
                     order_by='-created',
-                    only_fields=['id']
+                    only_fields=['id', 'created']
                 )
             )
             model = get_single_result(entity='model', query=model_name, results=res.response.models, log=self.log)
@@ -543,8 +551,9 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         """
         Set parameters for this task. This allows setting a complete set of key/value parameters, but does not support
         parameter descriptions (as the input is a dictionary or key/value pairs.
+
         :param args: Positional arguments (one or more dictionary or (key, value) iterable). These will be merged into
-         a single key/value dictionary.
+            a single key/value dictionary.
         :param kwargs: Key/value pairs, merged into the parameters dictionary created from `args`.
         """
         if not all(isinstance(x, (dict, collections.Iterable)) for x in args):
@@ -581,6 +590,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def set_parameter(self, name, value, description=None):
         """
         Set a single task parameter. This overrides any previous value for this parameter.
+
         :param name: Parameter name
         :param value: Parameter value
         :param description: Parameter description (unused for now)
@@ -592,6 +602,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def get_parameter(self, name, default=None):
         """
         Get a value for a parameter.
+
         :param name: Parameter name
         :param default: Default value
         :return: Parameter value (or default value if parameter is not defined)
@@ -607,12 +618,17 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         parameter descriptions (as the input is a dictionary or key/value pairs.
 
         :param args: Positional arguments (one or more dictionary or (key, value) iterable). These will be merged into
-         a single key/value dictionary.
+            a single key/value dictionary.
         :param kwargs: Key/value pairs, merged into the parameters dictionary created from `args`.
         """
         self.set_parameters(__update=True, *args, **kwargs)
 
     def set_model_label_enumeration(self, enumeration=None):
+        """
+        Set a dictionary of labels (text) to ids (integers) {str(label): integer(id)}
+
+        :param dict enumeration: For example: {str(label): integer(id)}
+        """
         enumeration = enumeration or {}
         execution = self.data.execution
         if enumeration is None:
@@ -621,6 +637,21 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 and all(isinstance(k, six.string_types) and isinstance(v, int) for k, v in enumeration.items())):
             raise ValueError('Expected label to be a dict[str => int]')
         execution.model_labels = enumeration
+        self._edit(execution=execution)
+
+    def set_artifacts(self, artifacts_list=None):
+        """
+        List of artifacts (tasks.Artifact) to update the task
+
+        :param list artifacts_list: list of artifacts (type tasks.Artifact)
+        """
+        if not Session.check_min_api_version('2.3'):
+            return False
+        if not (isinstance(artifacts_list, (list, tuple))
+                and all(isinstance(a, tasks.Artifact) for a in artifacts_list)):
+            raise ValueError('Expected artifacts to [tasks.Artifacts]')
+        execution = self.data.execution
+        execution.artifacts = artifacts_list
         self._edit(execution=execution)
 
     def _set_model_design(self, design=None):
@@ -633,7 +664,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def get_labels_enumeration(self):
         """
         Return a dictionary of labels (text) to ids (integers) {str(label): integer(id)}
-        :return:
+        :return: dict
         """
         if not self.data or not self.data.execution:
             return {}
@@ -668,7 +699,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         if self.project is None:
             return None
 
-        if self._project_name and self._project_name[0] == self.project:
+        if self._project_name and self._project_name[1] is not None and self._project_name[0] == self.project:
             return self._project_name[1]
 
         res = self.send(projects.GetByIdRequest(project=self.project), raise_on_errors=False)
@@ -680,8 +711,20 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def get_tags(self):
         return self._get_task_property("tags")
 
+    def set_system_tags(self, tags):
+        assert isinstance(tags, (list, tuple))
+        if Session.check_min_api_version('2.3'):
+            self._set_task_property("system_tags", tags)
+            self._edit(system_tags=self.data.system_tags)
+        else:
+            self._set_task_property("tags", tags)
+            self._edit(tags=self.data.tags)
+
     def set_tags(self, tags):
         assert isinstance(tags, (list, tuple))
+        if not Session.check_min_api_version('2.3'):
+            # not supported
+            return
         self._set_task_property("tags", tags)
         self._edit(tags=self.data.tags)
 
@@ -728,6 +771,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                    tags=None, parent=None, project=None, log=None, session=None):
         """
         Clone a task
+
         :param cloned_task_id: Task ID for the task to be cloned
         :type cloned_task_id: str
         :param name: New for the new task
@@ -779,12 +823,14 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     @classmethod
     def get_all(cls, session=None, log=None, **kwargs):
         """
-        Get all tasks
+        List all tasks based on specific projection
+
         :param session: Session object used for sending requests to the API
         :type session: Session
         :param log: Log object
         :type log: logging.Logger
         :param kwargs: Keyword args passed to the GetAllRequest (see .backend_api.services.tasks.GetAllRequest)
+            Example: status='completed', 'search_text'='specific_word', 'user'='user_id', 'project'='project_id'
         :type kwargs: dict
         :return: API response
         """

@@ -6,6 +6,8 @@ from tempfile import mkdtemp, mkstemp
 
 import pyparsing
 import six
+
+from .backend_api import Session
 from .backend_api.services import models
 from pathlib2 import Path
 from pyhocon import ConfigFactory, HOCONConverter
@@ -276,10 +278,13 @@ class BaseModel(object):
     def _set_package_tag(self):
         if self._package_tag not in self.tags:
             self.tags.append(self._package_tag)
-            self._get_base_model().update(tags=self.tags)
+            self._get_base_model().edit(tags=self.tags)
 
     @staticmethod
     def _config_dict_to_text(config):
+        # if already string return as is
+        if isinstance(config, six.string_types):
+            return config
         if not isinstance(config, dict):
             raise ValueError("Model configuration only supports dictionary objects")
         try:
@@ -372,10 +377,12 @@ class InputModel(BaseModel):
         weights_url = StorageHelper.conform_url(weights_url)
         if not weights_url:
             raise ValueError("Please provide a valid weights_url parameter")
+        extra = {'system_tags': ["-" + ARCHIVED_TAG]} \
+            if Session.check_min_api_version('2.3') else {'tags': ["-" + ARCHIVED_TAG]}
         result = _Model._get_default_session().send(models.GetAllRequest(
             uri=[weights_url],
-            only_fields=["id", "name"],
-            tags=["-" + ARCHIVED_TAG]
+            only_fields=["id", "name", "created"],
+            **extra
         ))
 
         if result.response.models:
@@ -678,7 +685,8 @@ class OutputModel(BaseModel):
         elif self._floating_data is not None:
             # we copy configuration / labels if they exist, obviously someone wants them as the output base model
             if _Model._unwrap_design(self._floating_data.design):
-                task.set_model_config(config_text=self._floating_data.design)
+                if not task.get_model_config_text():
+                    task.set_model_config(config_text=self._floating_data.design)
             else:
                 self._floating_data.design = _Model._wrap_design(self._task.get_model_config_text())
 
@@ -904,12 +912,12 @@ class OutputModel(BaseModel):
 
         config_text = self._resolve_config(config_text=config_text, config_dict=config_dict)
 
-        if self._task:
+        if self._task and not self._task.get_model_config_text():
             self._task.set_model_config(config_text=config_text)
 
         if self.id:
             # update the model object (this will happen if we resumed a training task)
-            result = self._get_force_base_model().update(design=config_text, task_id=self._task.id)
+            result = self._get_force_base_model().edit(design=config_text)
         else:
             self._floating_data.design = _Model._wrap_design(config_text)
             result = Waitable()
@@ -935,7 +943,7 @@ class OutputModel(BaseModel):
 
         if self.id:
             # update the model object (this will happen if we resumed a training task)
-            result = self._get_force_base_model().update(labels=labels, task_id=self._task.id)
+            result = self._get_force_base_model().edit(labels=labels)
         else:
             self._floating_data.labels = labels
             result = Waitable()
@@ -965,8 +973,8 @@ class OutputModel(BaseModel):
         config_text = self._task.get_model_config_text()
         parent = self._task.output_model_id or self._task.input_model_id
         self._base_model.update(
-            labels=labels,
-            design=config_text,
+            labels=self._floating_data.labels or labels,
+            design=self._floating_data.design or config_text,
             task_id=self._task.id,
             project_id=self._task.project,
             parent_id=parent,

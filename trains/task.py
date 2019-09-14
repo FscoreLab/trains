@@ -50,20 +50,20 @@ class Task(_Task):
     Task (experiment) object represents the current running experiments and connects all the different parts into \
     a fully reproducible experiment
 
-    Common usage is calling Task.init() to initialize the main task.
+    Common usage is calling :func:`Task.init` to initialize the main task.
     The main task is development / remote execution mode-aware, and supports connecting various SDK objects
-    such as Models etc. In development mode, the main task supports task reuse (see Task.init() for more
+    such as Models etc. In development mode, the main task supports task reuse (see :func:`Task.init` for more
     information in development mode features).
-    Any subsequent call to Task.init() will return the already-initialized main task
+    Any subsequent call to :func:`Task.init` will return the already-initialized main task
     and will not create a new main task.
 
     Sub-tasks, meaning tasks which are not the main task and are not development / remote execution mode aware, can be
-    created using Task.create(). These tasks do no support task reuse and any call
-    to Task.create() will always create a new task.
+    created using :func:`Task.create`. These tasks do no support task reuse and any call
+    to :func:`Task.create` will always create a new task.
 
-    You can also query existing tasks in the system by calling Task.get_task().
+    You can also query existing tasks in the system by calling :func:`Task.get_task`.
 
-    **Usage: Task.init(...), Task.create() or Task.get_task(...)**
+    **Usage:** :func:`Task.init` or :func:`Task.get_task`
     """
 
     TaskTypes = _Task.TaskTypes
@@ -90,9 +90,8 @@ class Task(_Task):
 
     def __init__(self, private=None, **kwargs):
         """
-        **Do not construct Task manually!**
-
-        please use Task.current_task() or Task.get_task(id=, project=, name=)
+        Do not construct Task manually!
+            **Please use Task.init() or Task.get_task(id=, project=, name=)**
         """
         if private is not Task.__create_protection:
             raise UsageError(
@@ -143,8 +142,14 @@ class Task(_Task):
             Notice! The reused task will be reset. (when running remotely, the usual behaviour applies)
             If reuse_last_task_id is of type string, it will assume this is the task_id to reuse!
             Note: A closed or published task will not be reused, and a new task will be created.
-        :param output_uri: Default location for output models (currently support folder/S3/GS/ ).
+        :param output_uri: Default location for output models (currently support folder/S3/GS/Azure ).
             notice: sub-folders (task_id) is created in the destination folder for all outputs.
+
+            Usage example: /mnt/share/folder, s3://bucket/folder , gs://bucket-name/folder,
+            azure://company.blob.core.windows.net/folder/
+
+            Note: When using cloud storage, make sure you install the accompany packages.
+            For example: trains[s3], trains[gs], trains[azure]
         :param auto_connect_arg_parser: Automatically grab the ArgParser and connect it with the task.
             if set to false, you can manually connect the ArgParser with task.connect(parser)
         :param auto_connect_frameworks: If true automatically patch MatplotLib, Keras callbacks, and TensorBoard/X to
@@ -304,7 +309,7 @@ class Task(_Task):
             If project is None, and the main execution task is initialized (Task.init), its project will be used.
             If project is provided but doesn't exist, it will be created.
         :param task_type: Task type to be created. (default: "training")
-        Optional Task types are: "training" / "testing" / "dataset_import" / "annotation" / "annotation_manual"
+            Optional Task types are: "training" / "testing" / "dataset_import" / "annotation" / "annotation_manual"
         :return: Task() object
         """
         if not project_name:
@@ -385,8 +390,10 @@ class Task(_Task):
                         task_id=default_task_id,
                         log_to_backend=True,
                     )
+                    task_tags = task.data.system_tags if hasattr(task.data, 'system_tags') else task.data.tags
                     if ((str(task.status) in (str(tasks.TaskStatusEnum.published), str(tasks.TaskStatusEnum.closed)))
-                            or (ARCHIVED_TAG in task.data.tags) or task.output_model_id):
+                            or task.output_model_id or (ARCHIVED_TAG in task_tags)
+                            or (cls._development_tag not in task_tags)):
                         # If the task is published or closed, we shouldn't reset it so we can't use it in dev mode
                         # If the task is archived, or already has an output model,
                         #  we shouldn't use it in development mode either
@@ -396,7 +403,7 @@ class Task(_Task):
                         # reset the task, so we can update it
                         task.reset(set_started_on_success=False, force=False)
                         # set development tags
-                        task.set_tags([cls._development_tag])
+                        task.set_system_tags([cls._development_tag])
                         # clear task parameters, they are not cleared by the Task reset
                         task.set_parameters({}, __update=False)
                         # clear the comment, it is not cleared on reset
@@ -405,6 +412,8 @@ class Task(_Task):
                         task.set_input_model(model_id='', update_task_design=False, update_task_labels=False)
                         task.set_model_config(config_text='')
                         task.set_model_label_enumeration({})
+                        task.set_artifacts([])
+                        task._set_storage_uri(None)
 
                 except (Exception, ValueError):
                     # we failed reusing task, create a new one
@@ -461,7 +470,7 @@ class Task(_Task):
         :param task_id: unique task id string (if exists other parameters are ignored)
         :param project_name: project name (str) the task belongs to
         :param task_name: task name (str) in within the selected project
-        :return: Task object
+        :return: Task() object
         """
         return Task.__get_task(task_id=task_id, project_name=project_name, task_name=task_name)
 
@@ -475,7 +484,7 @@ class Task(_Task):
         if value and value != self.storage_uri:
             from .storage.helper import StorageHelper
             helper = StorageHelper.get(value)
-            helper.check_write_permissions()
+            helper.check_write_permissions(value)
         self.storage_uri = value
 
     @property
@@ -552,7 +561,7 @@ class Task(_Task):
             If a logger was created before, this will be the new period and
             the old one will be discarded.
 
-        :return: .Logger object
+        :return: Logger object
         """
         if not self._logger:
             # force update of base logger to this current task (this is the main logger task)
@@ -596,7 +605,6 @@ class Task(_Task):
         flush any outstanding reports or console logs
 
         :param wait_for_uploads: if True the flush will exit only after all outstanding uploads are completed
-        :return: True
         """
 
         # make sure model upload is done
@@ -635,16 +643,43 @@ class Task(_Task):
         if self.is_main_task():
             self.__register_at_exit(None)
 
-    def add_artifact(self, name, artifact):
+    def register_artifact(self, name, artifact, metadata=None):
         """
         Add artifact for the current Task, used mostly for Data Audition.
         Currently supported artifacts object types: pandas.DataFrame
-        :param name: name of the artifacts. can override previous artifacts if name already exists
-        :type name: str
-        :param artifact: artifact object, supported artifacts object types: pandas.DataFrame
-        :type artifact: pandas.DataFrame
+
+        :param str name: name of the artifacts. Notice! it will override previous artifacts if name already exists.
+        :param pandas.DataFrame artifact: artifact object, supported artifacts object types: pandas.DataFrame
+        :param dict metadata: dictionary of key value to store with the artifact (visible in the UI)
         """
-        self._artifacts_manager.add_artifact(name=name, artifact=artifact)
+        self._artifacts_manager.register_artifact(name=name, artifact=artifact, metadata=metadata)
+
+    def unregister_artifact(self, name):
+        """
+        Remove artifact from the watch list. Notice this will not remove the artifacts from the Task.
+        It will only stop monitoring the artifact,
+        the last snapshot of the artifact will be taken immediately in the background.
+        """
+        self._artifacts_manager.unregister_artifact(name=name)
+
+    def upload_artifact(self, name, artifact_object, metadata=None, delete_after_upload=False):
+        """
+        Add static artifact to Task. Artifact file/object will be uploaded in the background
+        Raise ValueError if artifact_object is not supported
+
+        :param str name: Artifact name. Notice! it will override previous artifact if name already exists
+        :param object artifact_object: Artifact object to upload. Currently supports:
+            - string / pathlib2.Path are treated as path to artifact file to upload
+            - dict will be stored as .json,
+            - numpy.ndarray will be stored as .npz,
+            - PIL.Image will be stored to .png file and uploaded
+        :param dict metadata: Simple key/value dictionary to store on the artifact
+        :param bool delete_after_upload: If True local artifact will be deleted
+            (only applies if artifact_object is a local file)
+        :return: True if artifact will be uploaded
+        """
+        return self._artifacts_manager.upload_artifact(name=name, artifact_object=artifact_object,
+                                                       metadata=metadata, delete_after_upload=delete_after_upload)
 
     def is_current_task(self):
         """
@@ -688,7 +723,7 @@ class Task(_Task):
         Get Task model configuration text (before creating an output model)
         When an output model is created it will inherit these properties
 
-        :return model config_text (unconstrained text string). usually the content of a configuration file.
+        :return: model config_text (unconstrained text string). usually the content of a configuration file.
             If `config_text` is not None, `config_dict` must not be provided.
         """
         return super(Task, self).get_model_design()
@@ -698,7 +733,7 @@ class Task(_Task):
         Get Task model configuration dictionary (before creating an output model)
         When an output model is created it will inherit these properties
 
-        :return model config_text (unconstrained text string). usually the content of a configuration file.
+        :return: model config_text (unconstrained text string). usually the content of a configuration file.
             If `config_text` is not None, `config_dict` must not be provided.
         """
         config_text = self.get_model_config_text()
@@ -719,7 +754,7 @@ class Task(_Task):
         Return the last reported iteration (i.e. the maximum iteration the task reported a metric for)
         Notice, this is not a cached call, it will ask the backend for the answer (no local caching)
 
-        :return integer, last reported iteration number
+        :return: last reported iteration number (integer)
         """
         self.reload()
         return self.data.last_iteration
@@ -740,7 +775,9 @@ class Task(_Task):
         """
         Set new default TRAINS-server host and credentials
         These configurations will be overridden by wither OS environment variables or trains.conf configuration file
-        Notice: credentials needs to be set prior to Task initialization
+
+        Notice! credentials needs to be set *prior* to Task initialization
+
         :param host: host url, example: host='http://localhost:8008'
         :type  host: str
         :param key: user key/secret pair, example: key='thisisakey123'
