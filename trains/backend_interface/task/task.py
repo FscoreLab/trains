@@ -8,6 +8,7 @@ from threading import RLock, Thread
 import six
 from six.moves.urllib.parse import quote
 
+from ...backend_interface.task.repo.scriptinfo import ScriptRequirements
 from ...backend_interface.task.development.worker import DevWorker
 from ...backend_api import Session
 from ...backend_api.services import tasks, models, events, projects
@@ -160,7 +161,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 conf = get_config_for_bucket(base_url=output_dest)
                 if not conf:
                     msg = 'Failed resolving output destination (no credentials found for %s)' % output_dest
-                    self.log.warn(msg)
+                    self.log.warning(msg)
                     if raise_errors:
                         raise Exception(msg)
                 else:
@@ -187,34 +188,46 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 latest_version = CheckPackageUpdates.check_new_package_available(only_once=True)
                 if latest_version:
                     if not latest_version[1]:
-                        self.get_logger().console(
+                        self.get_logger().report_text(
                             'TRAINS new package available: UPGRADE to v{} is recommended!'.format(
                                 latest_version[0]),
                         )
                     else:
-                        self.get_logger().console(
+                        self.get_logger().report_text(
                             'TRAINS-SERVER new version available: upgrade to v{} is recommended!'.format(
                                 latest_version[0]),
                         )
             except Exception:
                 pass
 
+        # get repository and create requirements.txt from code base
         try:
             check_package_update_thread = Thread(target=check_package_update)
             check_package_update_thread.daemon = True
             check_package_update_thread.start()
-            result = ScriptInfo.get(log=self.log)
+            # do not request requirements, because it might be a long process, and we first want to update the git repo
+            result, script_requirements = ScriptInfo.get(log=self.log, create_requirements=False)
             for msg in result.warning_messages:
-                self.get_logger().console(msg)
+                self.get_logger().report_text(msg)
 
             self.data.script = result.script
             # Since we might run asynchronously, don't use self.data (lest someone else
             # overwrite it before we have a chance to call edit)
             self._edit(script=result.script)
             self.reload()
-            self._update_requirements(result.script.get('requirements') if result.script and
-                                                                           result.script.get('requirements') else '')
-            check_package_update_thread.join()
+            # if jupyter is present, requirements will be created in the background, when saving a snapshot
+            if result.script and script_requirements:
+                requirements = script_requirements.get_requirements()
+                if requirements:
+                    if not result.script['requirements']:
+                        result.script['requirements'] = {}
+                    result.script['requirements']['pip'] = requirements
+
+                self._update_requirements(result.script.get('requirements') or '')
+                self.reload()
+
+            # we do not want to wait for the check version thread,
+            # because someone might wait for us to finish the repo detection update
         except Exception as e:
             get_logger('task').debug(str(e))
 
@@ -243,7 +256,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         value = value.rstrip('/') if value else None
         self._storage_uri = StorageHelper.conform_url(value)
         self.data.output.destination = self._storage_uri
-        self._edit(output_dest=self._storage_uri or '')
+        self._edit(output_dest=self._storage_uri or ('' if Session.check_min_api_version('2.3') else None))
         if self._storage_uri or self._output_model:
             self.output_model.upload_storage_uri = self._storage_uri
 
@@ -418,16 +431,17 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
 
     def update_model_desc(self, new_model_desc_file=None):
         """ Change the task's model_desc """
-        execution = self._get_task_property('execution')
-        p = Path(new_model_desc_file)
-        if not p.is_file():
-            raise IOError('mode_desc file %s cannot be found' % new_model_desc_file)
-        new_model_desc = p.read_text()
-        model_desc_key = list(execution.model_desc.keys())[0] if execution.model_desc else 'design'
-        execution.model_desc[model_desc_key] = new_model_desc
+        with self._edit_lock:
+            execution = self._get_task_property('execution')
+            p = Path(new_model_desc_file)
+            if not p.is_file():
+                raise IOError('mode_desc file %s cannot be found' % new_model_desc_file)
+            new_model_desc = p.read_text()
+            model_desc_key = list(execution.model_desc.keys())[0] if execution.model_desc else 'design'
+            execution.model_desc[model_desc_key] = new_model_desc
 
-        res = self._edit(execution=execution)
-        return res.response
+            res = self._edit(execution=execution)
+            return res.response
 
     def update_output_model(self, model_uri, name=None, comment=None, tags=None):
         """
@@ -536,16 +550,17 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             model = None
             model_id = ''
 
-        # store model id
-        self.data.execution.model = model_id
+        with self._edit_lock:
+            # store model id
+            self.data.execution.model = model_id
 
-        # Auto populate input field from model, if they are empty
-        if update_task_design and not self.data.execution.model_desc:
-            self.data.execution.model_desc = model.design if model else ''
-        if update_task_labels and not self.data.execution.model_labels:
-            self.data.execution.model_labels = model.labels if model else {}
+            # Auto populate input field from model, if they are empty
+            if update_task_design and not self.data.execution.model_desc:
+                self.data.execution.model_desc = model.design if model else ''
+            if update_task_labels and not self.data.execution.model_labels:
+                self.data.execution.model_labels = model.labels if model else {}
 
-        self._edit(execution=self.data.execution)
+            self._edit(execution=self.data.execution)
 
     def set_parameters(self, *args, **kwargs):
         """
@@ -580,12 +595,13 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         # force cast all variables to strings (so that we can later edit them in UI)
         parameters = {k: str(v) if v is not None else "" for k, v in parameters.items()}
 
-        execution = self.data.execution
-        if execution is None:
-            execution = tasks.Execution(parameters=parameters)
-        else:
-            execution.parameters = parameters
-        self._edit(execution=execution)
+        with self._edit_lock:
+            execution = self.data.execution
+            if execution is None:
+                execution = tasks.Execution(parameters=parameters)
+            else:
+                execution.parameters = parameters
+            self._edit(execution=execution)
 
     def set_parameter(self, name, value, description=None):
         """
@@ -630,14 +646,15 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param dict enumeration: For example: {str(label): integer(id)}
         """
         enumeration = enumeration or {}
-        execution = self.data.execution
-        if enumeration is None:
-            return
-        if not (isinstance(enumeration, dict)
-                and all(isinstance(k, six.string_types) and isinstance(v, int) for k, v in enumeration.items())):
-            raise ValueError('Expected label to be a dict[str => int]')
-        execution.model_labels = enumeration
-        self._edit(execution=execution)
+        with self._edit_lock:
+            execution = self.data.execution
+            if enumeration is None:
+                return
+            if not (isinstance(enumeration, dict)
+                    and all(isinstance(k, six.string_types) and isinstance(v, int) for k, v in enumeration.items())):
+                raise ValueError('Expected label to be a dict[str => int]')
+            execution.model_labels = enumeration
+            self._edit(execution=execution)
 
     def set_artifacts(self, artifacts_list=None):
         """
@@ -650,16 +667,18 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         if not (isinstance(artifacts_list, (list, tuple))
                 and all(isinstance(a, tasks.Artifact) for a in artifacts_list)):
             raise ValueError('Expected artifacts to [tasks.Artifacts]')
-        execution = self.data.execution
-        execution.artifacts = artifacts_list
-        self._edit(execution=execution)
+        with self._edit_lock:
+            execution = self.data.execution
+            execution.artifacts = artifacts_list
+            self._edit(execution=execution)
 
     def _set_model_design(self, design=None):
-        execution = self.data.execution
-        if design is not None:
-            execution.model_desc = Model._wrap_design(design)
+        with self._edit_lock:
+            execution = self.data.execution
+            if design is not None:
+                execution.model_desc = Model._wrap_design(design)
 
-        self._edit(execution=execution)
+            self._edit(execution=execution)
 
     def get_labels_enumeration(self):
         """
@@ -805,11 +824,17 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         execution = task.execution.to_dict() if task.execution else {}
         execution = ConfigTree.merge_configs(ConfigFactory.from_dict(execution),
                                              ConfigFactory.from_dict(execution_overrides or {}))
+        # clear all artifacts
+        execution['artifacts'] = [e for e in execution['artifacts'] if e.get('mode') != 'output']
+
+        if not tags and task.tags:
+            tags = [t for t in task.tags if t != cls._development_tag]
+
         req = tasks.CreateRequest(
             name=name or task.name,
             type=task.type,
-            input=task.input,
-            tags=tags if tags is not None else task.tags,
+            input=task.input if hasattr(task, 'input') else {'view': {}},
+            tags=tags,
             comment=comment or task.comment,
             parent=parent,
             project=project if project else task.project,

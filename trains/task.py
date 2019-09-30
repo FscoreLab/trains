@@ -1,16 +1,15 @@
 import atexit
 import os
-import re
 import signal
 import sys
 import threading
 import time
 from argparse import ArgumentParser
 from collections import OrderedDict, Callable
+from typing import Optional
 
 import psutil
 import six
-from pathlib2 import Path
 
 from .binding.joblib_bind import PatchedJoblib
 from .backend_api.services import tasks, projects
@@ -29,18 +28,18 @@ from .errors import UsageError
 from .logger import Logger
 from .model import InputModel, OutputModel, ARCHIVED_TAG
 from .task_parameters import TaskParameters
-from .binding.artifacts import Artifacts
+from .binding.artifacts import Artifacts, Artifact
 from .binding.environ_bind import EnvironmentBind, PatchOsFork
 from .binding.absl_bind import PatchAbsl
 from .utilities.args import argparser_parseargs_called, get_argparser_last_args, \
     argparser_update_currenttask
 from .binding.frameworks.pytorch_bind import PatchPyTorchModelIO
-from .binding.frameworks.tensorflow_bind import PatchSummaryToEventTransformer, PatchTensorFlowEager, \
-    PatchKerasModelIO, PatchTensorflowModelIO
+from .binding.frameworks.tensorflow_bind import TensorflowBinding
 from .binding.frameworks.xgboost_bind import PatchXGBoostModelIO
 from .binding.matplotlib_bind import PatchedMatplotlib
 from .utilities.resource_monitor import ResourceMonitor
 from .utilities.seed import make_deterministic
+from .utilities.dicts import ReadOnlyDict
 
 NotSet = object()
 
@@ -113,6 +112,7 @@ class Task(_Task):
 
     @classmethod
     def current_task(cls):
+        # type: () -> Task
         """
         Return the Current Task object for the main execution task (task context).
         :return: Task() object or None
@@ -251,10 +251,7 @@ class Task(_Task):
                 PatchedJoblib.update_current_task(task)
                 PatchedMatplotlib.update_current_task(Task.__main_task)
                 PatchAbsl.update_current_task(Task.__main_task)
-                PatchSummaryToEventTransformer.update_current_task(task)
-                PatchTensorFlowEager.update_current_task(task)
-                PatchKerasModelIO.update_current_task(task)
-                PatchTensorflowModelIO.update_current_task(task)
+                TensorflowBinding.update_current_task(task)
                 PatchPyTorchModelIO.update_current_task(task)
                 PatchXGBoostModelIO.update_current_task(task)
             if auto_resource_monitoring:
@@ -279,7 +276,7 @@ class Task(_Task):
         # The logger will automatically take care of all patching (we just need to make sure to initialize it)
         logger = task.get_logger()
         # show the debug metrics page in the log, it is very convenient
-        logger.console(
+        logger.report_text(
             'TRAINS results page: {}/projects/{}/experiments/{}/output/log'.format(
                 task._get_app_server(),
                 task.project if task.project is not None else '*',
@@ -345,7 +342,7 @@ class Task(_Task):
     def _create_dev_task(cls, default_project_name, default_task_name, default_task_type, reuse_last_task_id):
         if not default_project_name or not default_task_name:
             # get project name and task name from repository name and entry_point
-            result = ScriptInfo.get(create_requirements=False, check_uncommitted=False)
+            result, _ = ScriptInfo.get(create_requirements=False, check_uncommitted=False)
             if not default_project_name:
                 # noinspection PyBroadException
                 try:
@@ -439,12 +436,12 @@ class Task(_Task):
         task._setup_log(replace_existing=True)
         logger = task.get_logger()
         if closed_old_task:
-            logger.console('TRAINS Task: Closing old development task id={}'.format(default_task.get('id')))
+            logger.report_text('TRAINS Task: Closing old development task id={}'.format(default_task.get('id')))
         # print warning, reusing/creating a task
         if default_task_id:
-            logger.console('TRAINS Task: overwriting (reusing) task id=%s' % task.id)
+            logger.report_text('TRAINS Task: overwriting (reusing) task id=%s' % task.id)
         else:
-            logger.console('TRAINS Task: created new task id=%s' % task.id)
+            logger.report_text('TRAINS Task: created new task id=%s' % task.id)
 
         # update current repository and put warning into logs
         if in_dev_mode and cls.__detect_repo_async:
@@ -462,8 +459,8 @@ class Task(_Task):
         thread.start()
         return task
 
-    @staticmethod
-    def get_task(task_id=None, project_name=None, task_name=None):
+    @classmethod
+    def get_task(cls, task_id=None, project_name=None, task_name=None):
         """
         Returns Task object based on either, task_id (system uuid) or task name
 
@@ -472,7 +469,7 @@ class Task(_Task):
         :param task_name: task name (str) in within the selected project
         :return: Task() object
         """
-        return Task.__get_task(task_id=task_id, project_name=project_name, task_name=task_name)
+        return cls.__get_task(task_id=task_id, project_name=project_name, task_name=task_name)
 
     @property
     def output_uri(self):
@@ -490,10 +487,14 @@ class Task(_Task):
     @property
     def artifacts(self):
         """
-        dictionary of Task artifacts (name, artifact)
+        read-only dictionary of Task artifacts (name, artifact)
         :return: dict
         """
-        return self._artifacts_manager.artifacts
+        if not Session.check_min_api_version('2.3'):
+            return ReadOnlyDict()
+        if not self.data.execution or not self.data.execution.artifacts:
+            return ReadOnlyDict()
+        return ReadOnlyDict([(a.key, Artifact(a)) for a in self.data.execution.artifacts])
 
     def set_comment(self, comment):
         """
@@ -553,6 +554,7 @@ class Task(_Task):
         raise Exception('Unsupported mutable type %s: no connect function found' % type(mutable).__name__)
 
     def get_logger(self, flush_period=NotSet):
+        # type: (Optional[float]) -> Logger
         """
         get a logger object for reporting based on the task
 
@@ -615,7 +617,8 @@ class Task(_Task):
         if self._logger:
             # noinspection PyProtectedMember
             self._logger._flush_stdout_handler()
-        self.reporter.flush()
+        if self._reporter:
+            self.reporter.flush()
         LoggerRoot.flush()
 
         return True
@@ -662,6 +665,15 @@ class Task(_Task):
         """
         self._artifacts_manager.unregister_artifact(name=name)
 
+    def get_registered_artifacts(self):
+        """
+        dictionary of Task registered artifacts (name, artifact object)
+        Notice these objects can be modified, changes will be uploaded automatically
+
+        :return: dict
+        """
+        return self._artifacts_manager.registered_artifacts
+
     def upload_artifact(self, name, artifact_object, metadata=None, delete_after_upload=False):
         """
         Add static artifact to Task. Artifact file/object will be uploaded in the background
@@ -670,8 +682,10 @@ class Task(_Task):
         :param str name: Artifact name. Notice! it will override previous artifact if name already exists
         :param object artifact_object: Artifact object to upload. Currently supports:
             - string / pathlib2.Path are treated as path to artifact file to upload
-            - dict will be stored as .json,
-            - numpy.ndarray will be stored as .npz,
+                If wildcard or a folder is passed, zip file containing the local files will be created and uploaded
+            - dict will be stored as .json file and uploaded
+            - pandas.DataFrame will be stored as .csv.gz (compressed CSV file) and uploaded
+            - numpy.ndarray will be stored as .npz and uploaded
             - PIL.Image will be stored to .png file and uploaded
         :param dict metadata: Simple key/value dictionary to store on the artifact
         :param bool delete_after_upload: If True local artifact will be deleted
@@ -935,7 +949,7 @@ class Task(_Task):
         if self._at_exit_called:
             return
 
-        self.get_logger().warn(
+        self.log.warning(
             "### TASK STOPPED - USER ABORTED - {} ###".format(
                 stop_reason.upper().replace('_', ' ')
             )
@@ -998,7 +1012,14 @@ class Task(_Task):
                 if self._detect_repo_async_thread:
                     try:
                         if self._detect_repo_async_thread.is_alive():
+                            self.log.info('Waiting for repository detection and full package requirement analysis')
                             self._detect_repo_async_thread.join(timeout=timeout)
+                            # because join has no return value
+                            if self._detect_repo_async_thread.is_alive():
+                                self.log.info('Repository and package analysis timed out ({} sec), '
+                                              'giving up'.format(timeout))
+                            else:
+                                self.log.info('Finished repository detection and package analysis')
                         self._detect_repo_async_thread = None
                     except Exception:
                         pass
@@ -1007,7 +1028,7 @@ class Task(_Task):
         # signal artifacts upload, and stop daemon
         self._artifacts_manager.stop(wait=True)
         # print artifacts summary
-        self.get_logger().console(self._artifacts_manager.summary)
+        self.get_logger().report_text(self._artifacts_manager.summary)
 
     def _at_exit(self):
         """
@@ -1045,7 +1066,7 @@ class Task(_Task):
                             task_status = ('stopped', )
 
             # wait for repository detection (if we didn't crash)
-            if not is_sub_process and wait_for_uploads:
+            if not is_sub_process and wait_for_uploads and self._logger:
                 # we should print summary here
                 self._summary_artifacts()
                 # make sure that if we crashed the thread we are not waiting forever
@@ -1053,17 +1074,19 @@ class Task(_Task):
 
             # wait for uploads
             print_done_waiting = False
-            if wait_for_uploads and (BackendModel.get_num_results() > 0 or self.reporter.get_num_results() > 0):
+            if wait_for_uploads and (BackendModel.get_num_results() > 0 or
+                                     (self._reporter and self.reporter.get_num_results() > 0)):
                 self.log.info('Waiting to finish uploads')
                 print_done_waiting = True
             # from here, do not send log in background thread
             if wait_for_uploads:
                 self.flush(wait_for_uploads=True)
                 # wait until the reporter flush everything
-                self.reporter.stop()
+                if self._reporter:
+                    self.reporter.stop()
                 if print_done_waiting:
                     self.log.info('Finished uploading')
-            else:
+            elif self._logger:
                 self._logger._flush_stdout_handler()
 
             if not is_sub_process:
@@ -1085,9 +1108,11 @@ class Task(_Task):
             if self._resource_monitor:
                 self._resource_monitor.stop()
 
-            self._logger.set_flush_period(None)
+            if self._logger:
+                self._logger.set_flush_period(None)
             # this is so in theory we can close a main task and start a new one
-            Task.__main_task = None
+            if self.is_main_task():
+                Task.__main_task = None
         except Exception:
             # make sure we do not interrupt the exit process
             pass
@@ -1252,10 +1277,10 @@ class Task(_Task):
             tasks.GetAllRequest(
                 project=[project.id],
                 name=exact_match_regex(task_name),
-                only_fields=['id', 'name']
+                only_fields=['id', 'name', 'last_update']
             )
         )
-        task = get_single_result(entity='task', query=task_name, results=res.response.tasks)
+        task = get_single_result(entity='task', query=task_name, results=res.response.tasks, raise_on_error=False)
 
         return cls(
             private=cls.__create_protection,
