@@ -20,7 +20,7 @@ class InterfaceBase(SessionInterface):
     _default_session = None
 
     @property
-    def session(self):о
+    def session(self):
         return self._session
 
     @property
