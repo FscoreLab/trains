@@ -2,8 +2,10 @@
 import collections
 import itertools
 import logging
+import os
 from enum import Enum
-from threading import RLock, Thread
+from threading import Thread
+from multiprocessing import RLock
 
 import six
 from six.moves.urllib.parse import quote
@@ -86,7 +88,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         self._curr_label_stats = {}
         self._raise_on_validation_errors = raise_on_validation_errors
         self._parameters_allowed_types = (
-                six.string_types + six.integer_types + (six.text_type, float, list, dict, type(None))
+                six.string_types + six.integer_types + (six.text_type, float, list, tuple, dict, type(None))
         )
         self._app_server = None
         self._files_server = None
@@ -188,9 +190,11 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 latest_version = CheckPackageUpdates.check_new_package_available(only_once=True)
                 if latest_version:
                     if not latest_version[1]:
+                        sep = os.linesep
                         self.get_logger().report_text(
-                            'TRAINS new package available: UPGRADE to v{} is recommended!'.format(
-                                latest_version[0]),
+                            'TRAINS new package available: UPGRADE to v{} is recommended! '
+                            '{}'.format(
+                                latest_version[0], sep.join(latest_version[2])),
                         )
                     else:
                         self.get_logger().report_text(

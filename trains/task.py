@@ -41,8 +41,6 @@ from .utilities.resource_monitor import ResourceMonitor
 from .utilities.seed import make_deterministic
 from .utilities.dicts import ReadOnlyDict
 
-NotSet = object()
-
 
 class Task(_Task):
     """
@@ -66,6 +64,8 @@ class Task(_Task):
     """
 
     TaskTypes = _Task.TaskTypes
+
+    NotSet = object()
 
     __create_protection = object()
     __main_task = None
@@ -136,7 +136,8 @@ class Task(_Task):
 
         :param project_name: project to create the task in (if project doesn't exist, it will be created)
         :param task_name: task name to be created (in development mode, not when running remotely)
-        :param task_type: task type to be created (in development mode, not when running remotely)
+        :param task_type: task type to be created, Default: TaskTypes.training
+            Options are: 'testing', 'training' or 'train', 'inference'
         :param reuse_last_task_id: start with the previously used task id (stored in the data cache folder).
             if False every time we call the function we create a new task with the same name
             Notice! The reused task will be reset. (when running remotely, the usual behaviour applies)
@@ -181,6 +182,8 @@ class Task(_Task):
             # if this is a subprocess, regardless of what the init was called for,
             # we have to fix the main task hooks and stdout bindings
             if cls.__forked_proc_main_pid != os.getpid() and PROC_MASTER_ID_ENV_VAR.get() != os.getpid():
+                if task_type is None:
+                    task_type = cls.__main_task.task_type
                 # make sure we only do it once  per process
                 cls.__forked_proc_main_pid = os.getpid()
                 # make sure we do not wait for the repo detect thread
@@ -222,6 +225,13 @@ class Task(_Task):
             # Backwards compatibility: if called from Task.current_task and task_type
             # was not specified, keep legacy default value of TaskTypes.training
             task_type = cls.TaskTypes.training
+        elif isinstance(task_type, six.string_types):
+            task_type_lookup = {'testing': cls.TaskTypes.testing, 'inference': cls.TaskTypes.testing,
+                                'train': cls.TaskTypes.training, 'training': cls.TaskTypes.training,}
+            if task_type not in task_type_lookup:
+                raise ValueError("Task type '{}' not supported, options are: {}".format(task_type,
+                                                                                      list(task_type_lookup.keys())))
+            task_type = task_type_lookup[task_type]
 
         try:
             if not running_remotely():
@@ -481,6 +491,9 @@ class Task(_Task):
         if value and value != self.storage_uri:
             from .storage.helper import StorageHelper
             helper = StorageHelper.get(value)
+            if not helper:
+                raise ValueError("Could not get access credentials for '{}' "
+                                 ", check configuration file ~/trains.conf".format(value))
             helper.check_write_permissions(value)
         self.storage_uri = value
 
@@ -553,37 +566,15 @@ class Task(_Task):
 
         raise Exception('Unsupported mutable type %s: no connect function found' % type(mutable).__name__)
 
-    def get_logger(self, flush_period=NotSet):
-        # type: (Optional[float]) -> Logger
+    def get_logger(self):
+        # type: () -> Logger
         """
-        get a logger object for reporting based on the task
-
-        :param flush_period: The period of the logger flush.
-            If None of any other False value, will not flush periodically.
-            If a logger was created before, this will be the new period and
-            the old one will be discarded.
+        get a logger object for reporting, for this task context.
+        All reports (metrics, text etc.) related to this task are accessible in the web UI
 
         :return: Logger object
         """
-        if not self._logger:
-            # force update of base logger to this current task (this is the main logger task)
-            self._setup_log(replace_existing=self.is_main_task())
-            # Get a logger object
-            self._logger = Logger(private_task=self)
-            # make sure we set our reported to async mode
-            # we make sure we flush it in self._at_exit
-            self.reporter.async_enable = True
-            # if we just created the logger, set default flush period
-            if not flush_period or flush_period is NotSet:
-                flush_period = DevWorker.report_period
-
-        if isinstance(flush_period, (int, float)):
-            flush_period = int(abs(flush_period))
-
-        if flush_period is None or isinstance(flush_period, int):
-            self._logger.set_flush_period(flush_period)
-
-        return self._logger
+        return self._get_logger()
 
     def mark_started(self):
         """
@@ -703,7 +694,7 @@ class Task(_Task):
 
         If Task.init() was never called, this method will *not* create
         it, making this test cheaper than Task.init() == task
-        
+
         :return: True if this task is the current task
         """
         return self.is_main_task()
@@ -784,6 +775,21 @@ class Task(_Task):
         self.data.last_iteration = int(last_iteration)
         self._edit(last_iteration=self.data.last_iteration)
 
+    def get_last_scalar_metrics(self):
+        """
+        Extract the last scalar metrics, ordered by title & series in a nested dictionary
+
+        :return: dict. Example: {'title': {'series': {'last': 0.5, 'min': 0.1, 'max': 0.9}}}
+        """
+        self.reload()
+        metrics = self.data.last_metrics
+        scalar_metrics = dict()
+        for i in metrics.values():
+            for j in i.values():
+                scalar_metrics.setdefault(j['metric'], {}).setdefault(
+                    j['variant'], {'last': j['value'], 'min': j['min_value'], 'max': j['max_value']})
+        return scalar_metrics
+
     @classmethod
     def set_credentials(cls, host=None, key=None, secret=None):
         """
@@ -805,6 +811,40 @@ class Task(_Task):
             Session.default_key = key
         if secret:
             Session.default_secret = secret
+
+    def _get_logger(self, flush_period=NotSet):
+        # type: (Optional[float]) -> Logger
+        """
+        get a logger object for reporting based on the task
+
+        :param flush_period: The period of the logger flush.
+            If None of any other False value, will not flush periodically.
+            If a logger was created before, this will be the new period and
+            the old one will be discarded.
+
+        :return: Logger object
+        """
+        pass
+
+        if not self._logger:
+            # force update of base logger to this current task (this is the main logger task)
+            self._setup_log(replace_existing=self.is_main_task())
+            # Get a logger object
+            self._logger = Logger(private_task=self)
+            # make sure we set our reported to async mode
+            # we make sure we flush it in self._at_exit
+            self.reporter.async_enable = True
+            # if we just created the logger, set default flush period
+            if not flush_period or flush_period is self.NotSet:
+                flush_period = DevWorker.report_period
+
+        if isinstance(flush_period, (int, float)):
+            flush_period = int(abs(flush_period))
+
+        if flush_period is None or isinstance(flush_period, int):
+            self._logger.set_flush_period(flush_period)
+
+        return self._logger
 
     def _connect_output_model(self, model):
         assert isinstance(model, OutputModel)
@@ -841,7 +881,7 @@ class Task(_Task):
         comment += 'Using model id: {}'.format(model.id)
         self.set_comment(comment)
         if self._last_input_model_id and self._last_input_model_id != model.id:
-            self.log.warning('Task connect, second input model is not supported, adding into comment section')
+            self.log.info('Task connect, second input model is not supported, adding into comment section')
             return
         self._last_input_model_id = model.id
         model.connect(self)
@@ -1306,7 +1346,7 @@ class Task(_Task):
         task_data = task_sessions.get(hash_key)
         if task_data is None:
             return None
-        
+
         try:
             task_data['type'] = cls.TaskTypes(task_data['type'])
         except (ValueError, KeyError):
@@ -1368,15 +1408,15 @@ class Task(_Task):
     def __task_is_relevant(cls, task_data):
         """
         Check that a cached task is relevant for reuse.
-        
+
         A task is relevant for reuse if:
             1. It is not timed out i.e it was last use in the previous 24 hours.
             2. It's name, project and type match the data in the server, so not
                to override user changes made by using the UI.
-               
+
         :param task_data: A mapping from 'id', 'name', 'project', 'type' keys
             to the task's values, as saved in the cache.
-            
+
         :return: True if the task is relevant for reuse, False if not.
         """
         if not task_data:
