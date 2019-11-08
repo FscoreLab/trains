@@ -1,6 +1,8 @@
 # TRAINS
 ## Auto-Magical Experiment Manager & Version Control for AI
 
+## :tada: Now with Full DevOps :confetti_ball: checkout the new addition [TRAINS AGENT](https://github.com/allegroai/trains-agent)
+
 "Because it’s a jungle out there"
 
 [![GitHub license](https://img.shields.io/github/license/allegroai/trains.svg)](https://img.shields.io/github/license/allegroai/trains.svg)
@@ -55,6 +57,18 @@ TRAINS is a two part solution:
     - Install TRAINS
 
             pip install trains
+    		
+		<details>
+		<summary>Add optional cloud storage support (S3/GoogleStorage/Azure):</summary>
+
+		```bash
+		pip install trains[s3]
+		pip install trains[gs]
+		pip install trains[azure]
+		```
+		
+		</details>
+
 
     - Add the following lines to your code
 
