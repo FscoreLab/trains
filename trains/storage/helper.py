@@ -266,10 +266,10 @@ class StorageHelper(object):
         # Don't canonize URL since we already did it
         try:
             instance = cls(base_url=base_url, url=url, logger=logger, canonize_url=False, **kwargs)
-        except Exception:
+        except Exception as e:
+            print(e)
             log.error("Failed credentials for {}".format(base_url or url))
             return None
-
         cls._helpers[instance_key] = instance
         return instance
 
