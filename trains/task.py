@@ -5,6 +5,9 @@ import sys
 import threading
 import time
 from argparse import ArgumentParser
+from tempfile import mkstemp
+
+from pathlib2 import Path
 from collections import OrderedDict, Callable
 from typing import Optional
 
@@ -40,6 +43,8 @@ from .binding.matplotlib_bind import PatchedMatplotlib
 from .utilities.resource_monitor import ResourceMonitor
 from .utilities.seed import make_deterministic
 from .utilities.dicts import ReadOnlyDict
+from .utilities.proxy_object import ProxyDictPreWrite, ProxyDictPostWrite, flatten_dictionary, \
+    nested_from_flat_dictionary
 
 
 class Task(_Task):
@@ -74,6 +79,7 @@ class Task(_Task):
     __task_id_reuse_time_window_in_hours = float(config.get('development.task_reuse_time_window_in_hours', 24.0))
     __store_diff_on_train = config.get('development.store_uncommitted_code_diff_on_train', False)
     __detect_repo_async = config.get('development.vcs_repo_detect_async', False)
+    __default_output_uri = config.get('development.default_output_uri', None)
 
     class _ConnectedParametersType(object):
         argparse = "argument_parser"
@@ -153,8 +159,13 @@ class Task(_Task):
             For example: trains[s3], trains[gs], trains[azure]
         :param auto_connect_arg_parser: Automatically grab the ArgParser and connect it with the task.
             if set to false, you can manually connect the ArgParser with task.connect(parser)
-        :param auto_connect_frameworks: If true automatically patch MatplotLib, Keras callbacks, and TensorBoard/X to
-            serialize plots, graphs and model location to trains backend (in addition to original output destination)
+        :param auto_connect_frameworks: If True automatically patch MatplotLib, XGBoost, scikit-learn,
+            Keras callbacks, and TensorBoard/X to serialize plots, graphs and model location to trains backend
+            (in addition to original output destination).
+            Fine grained control is possible by passing a dictionary instead of a Boolean.
+            Missing keys are considered to have True value, empty dictionary is considered as False, full example:
+                auto_connect_frameworks={'matplotlib': True, 'tensorflow': True, 'pytorch': True,
+                    'xgboost': True, 'scikit': True}
         :param auto_resource_monitoring: If true, machine vitals will be sent along side the task scalars,
             Resources graphs will appear under the title ':resource monitor:' in the scalars tab.
         :return: Task() object
@@ -171,7 +182,8 @@ class Task(_Task):
                 if default is not None and default != current:
                     raise UsageError(
                         "Current task already created "
-                        "and requested {field} '{default}' does not match current {field} '{current}'".format(
+                        "and requested {field} '{default}' does not match current {field} '{current}'. "
+                        "If you wish to create additional tasks use `Task.create`".format(
                             field=field,
                             default=default,
                             current=current,
@@ -243,12 +255,16 @@ class Task(_Task):
                 )
                 if output_uri:
                     task.output_uri = output_uri
+                elif cls.__default_output_uri:
+                    task.output_uri = cls.__default_output_uri
             else:
                 task = cls(
                     private=cls.__create_protection,
                     task_id=get_remote_task_id(),
                     log_to_backend=False,
                 )
+                if cls.__default_output_uri and not task.output_uri:
+                    task.output_uri = cls.__default_output_uri
         except Exception:
             raise
         else:
@@ -258,12 +274,18 @@ class Task(_Task):
             # patch OS forking
             PatchOsFork.patch_fork()
             if auto_connect_frameworks:
-                PatchedJoblib.update_current_task(task)
-                PatchedMatplotlib.update_current_task(Task.__main_task)
-                PatchAbsl.update_current_task(Task.__main_task)
-                TensorflowBinding.update_current_task(task)
-                PatchPyTorchModelIO.update_current_task(task)
-                PatchXGBoostModelIO.update_current_task(task)
+                is_auto_connect_frameworks_bool = not isinstance(auto_connect_frameworks, dict)
+                if is_auto_connect_frameworks_bool or auto_connect_frameworks.get('scikit', True):
+                    PatchedJoblib.update_current_task(task)
+                if is_auto_connect_frameworks_bool or auto_connect_frameworks.get('matplotlib', True):
+                    PatchedMatplotlib.update_current_task(Task.__main_task)
+                if is_auto_connect_frameworks_bool or auto_connect_frameworks.get('tensorflow', True):
+                    PatchAbsl.update_current_task(Task.__main_task)
+                    TensorflowBinding.update_current_task(task)
+                if is_auto_connect_frameworks_bool or auto_connect_frameworks.get('pytorch', True):
+                    PatchPyTorchModelIO.update_current_task(task)
+                if is_auto_connect_frameworks_bool or auto_connect_frameworks.get('xgboost', True):
+                    PatchXGBoostModelIO.update_current_task(task)
             if auto_resource_monitoring:
                 task._resource_monitor = ResourceMonitor(task)
                 task._resource_monitor.start()
@@ -302,8 +324,8 @@ class Task(_Task):
     @classmethod
     def create(
             cls,
-            task_name=None,
             project_name=None,
+            task_name=None,
             task_type=TaskTypes.training,
     ):
         """
@@ -311,10 +333,10 @@ class Task(_Task):
 
         Notice: This function will always create a new task, whether running in development or remote execution mode.
 
-        :param task_name: task name to be created
         :param project_name: Project to create the task in.
             If project is None, and the main execution task is initialized (Task.init), its project will be used.
             If project is provided but doesn't exist, it will be created.
+        :param task_name: task name to be created
         :param task_type: Task type to be created. (default: "training")
             Optional Task types are: "training" / "testing" / "dataset_import" / "annotation" / "annotation_manual"
         :return: Task() object
@@ -343,12 +365,26 @@ class Task(_Task):
         """
         Returns Task object based on either, task_id (system uuid) or task name
 
-        :param task_id: unique task id string (if exists other parameters are ignored)
-        :param project_name: project name (str) the task belongs to
-        :param task_name: task name (str) in within the selected project
-        :return: Task() object
+        :param str task_id: unique task id string (if exists other parameters are ignored)
+        :param str project_name: project name (str) the task belongs to
+        :param str task_name: task name (str) in within the selected project
+        :return: Task object
         """
         return cls.__get_task(task_id=task_id, project_name=project_name, task_name=task_name)
+
+    @classmethod
+    def get_tasks(cls, task_ids=None, project_name=None, task_name=None):
+        """
+        Returns a list of Task objects, matching requested task name (or partially matching)
+
+        :param list(str) task_ids: list of unique task id string (if exists other parameters are ignored)
+        :param str project_name: project name (str) the task belongs to (use None for all projects)
+        :param str task_name: task name (str) in within the selected project
+            Return any partial match of task_name, regular expressions matching is also supported
+            If None is passed, returns all tasks within the project
+        :return: list of Task object
+        """
+        return cls.__get_tasks(task_ids=task_ids, project_name=project_name, task_name=task_name)
 
     @property
     def output_uri(self):
@@ -374,9 +410,12 @@ class Task(_Task):
         """
         if not Session.check_min_api_version('2.3'):
             return ReadOnlyDict()
-        if not self.data.execution or not self.data.execution.artifacts:
-            return ReadOnlyDict()
-        return ReadOnlyDict([(a.key, Artifact(a)) for a in self.data.execution.artifacts])
+        artifacts_pairs = []
+        if self.data.execution and self.data.execution.artifacts:
+            artifacts_pairs = [(a.key, Artifact(a)) for a in self.data.execution.artifacts]
+        if self._artifacts_manager:
+            artifacts_pairs += list(self._artifacts_manager.registered_artifacts.items())
+        return ReadOnlyDict(artifacts_pairs)
 
     @classmethod
     def clone(cls, source_task=None, name=None, comment=None, parent=None, project=None):
@@ -458,19 +497,6 @@ class Task(_Task):
         resp = res.response
         return resp
 
-    def set_comment(self, comment):
-        """
-        Set a comment text to the task.
-
-        In remote, this is a no-op.
-
-        :param comment: The comment of the task
-        :type comment: str
-        """
-        if not running_remotely() or not self.is_main_task():
-            self._edit(comment=comment)
-            self.reload()
-
     def add_tags(self, tags):
         """
         Add tags to this task. Old tags are not deleted
@@ -514,6 +540,93 @@ class Task(_Task):
                 return method(mutable)
 
         raise Exception('Unsupported mutable type %s: no connect function found' % type(mutable).__name__)
+
+    def connect_configuration(self, configuration):
+        """
+        Connect a configuration dict / file (pathlib.Path / str) with the Task
+        Connecting configuration file should be called before reading the configuration file.
+        When an output model will be created it will include the content of the configuration dict/file
+
+        Example local file:
+            config_file = task.connect_configuration(config_file)
+            my_params = json.load(open(config_file,'rt'))
+
+        Example parameter dictionary:
+            my_params = task.connect_configuration(my_params)
+
+        :param (dict, pathlib.Path/str) configuration: usually configuration file used in the model training process
+            configuration can be either dict or path to local file.
+            If dict is provided, it will be stored in json alike format (hocon) editable in the UI
+            If pathlib2.Path / string is provided the content of the file will be stored
+            Notice: local path must be relative path
+            (and in remote execution, the content of the file will be overwritten with the content brought from the UI)
+        :return: configuration object
+            If dict was provided, a dictionary will be returned
+            If pathlib2.Path / string was provided, a path to a local configuration file is returned
+        """
+        if not isinstance(configuration, (dict, Path, six.string_types)):
+            raise ValueError("connect_configuration supports `dict`, `str` and 'Path' types, "
+                             "{} is not supported".format(type(configuration)))
+
+        # parameter dictionary
+        if isinstance(configuration, dict):
+            def _update_config_dict(task, config_dict):
+                task.set_model_config(config_dict=config_dict)
+
+            if not running_remotely():
+                self.set_model_config(config_dict=configuration)
+                configuration = ProxyDictPostWrite(self, _update_config_dict, **configuration)
+            else:
+                configuration.clear()
+                configuration.update(self.get_model_config_dict())
+                configuration = ProxyDictPreWrite(False, False, **configuration)
+            return configuration
+
+        # it is a path to a local file
+        if not running_remotely():
+            # check if not absolute path
+            configuration_path = Path(configuration)
+            if not configuration_path.is_file():
+                ValueError("Configuration file does not exist")
+            try:
+                with open(configuration_path.as_posix(), 'rt') as f:
+                    configuration_text = f.read()
+            except Exception:
+                raise ValueError("Could not connect configuration file {}, file could not be read".format(
+                    configuration_path.as_posix()))
+            self.set_model_config(config_text=configuration_text)
+            return configuration
+        else:
+            configuration_text = self.get_model_config_text()
+            configuration_path = Path(configuration)
+            fd, local_filename = mkstemp(prefix='trains_task_config_',
+                                         suffix=configuration_path.suffixes[-1] if
+                                         configuration_path.suffixes else '.txt')
+            os.write(fd, configuration_text.encode('utf-8'))
+            os.close(fd)
+            return Path(local_filename) if isinstance(configuration, Path) else local_filename
+
+    def connect_label_enumeration(self, enumeration):
+        """
+        Connect a label enumeration dictionary with the Task
+
+        When an output model is created it will store the model label enumeration dictionary
+
+        :param dict enumeration: dictionary of string to integer, enumerating the model output integer to labels
+            example: {'background': 0 , 'person': 1}
+        :return: enumeration dict
+        """
+        if not isinstance(enumeration, dict):
+            raise ValueError("connect_label_enumeration supports only `dict` type, "
+                             "{} is not supported".format(type(enumeration)))
+
+        if not running_remotely():
+            self.set_model_label_enumeration(enumeration)
+        else:
+            # pop everything
+            enumeration.clear()
+            enumeration.update(self.get_labels_enumeration())
+        return enumeration
 
     def get_logger(self):
         # type: () -> Logger
@@ -705,13 +818,13 @@ class Task(_Task):
 
     def get_last_iteration(self):
         """
-        Return the last reported iteration (i.e. the maximum iteration the task reported a metric for)
+        Return the maximum reported iteration (i.e. the maximum iteration the task reported a metric for)
         Notice, this is not a cached call, it will ask the backend for the answer (no local caching)
 
         :return: last reported iteration number (integer)
         """
         self.reload()
-        return self.data.last_iteration
+        return max(self.data.last_iteration, self._reporter.max_iteration if self._reporter else 0)
 
     def set_last_iteration(self, last_iteration):
         """
@@ -740,26 +853,34 @@ class Task(_Task):
         return scalar_metrics
 
     @classmethod
-    def set_credentials(cls, host=None, key=None, secret=None):
+    def set_credentials(cls, api_host=None, web_host=None, files_host=None, key=None, secret=None, host=None):
         """
         Set new default TRAINS-server host and credentials
         These configurations will be overridden by wither OS environment variables or trains.conf configuration file
 
         Notice! credentials needs to be set *prior* to Task initialization
 
-        :param host: host url, example: host='http://localhost:8008'
-        :type  host: str
-        :param key: user key/secret pair, example: key='thisisakey123'
-        :type  key: str
-        :param secret: user key/secret pair, example: secret='thisisseceret123'
-        :type  secret: str
+        :param str api_host: Trains API server url, example: host='http://localhost:8008'
+        :param str web_host: Trains WEB server url, example: host='http://localhost:8080'
+        :param str files_host: Trains Files server url, example: host='http://localhost:8081'
+        :param str key: user key/secret pair, example: key='thisisakey123'
+        :param str secret: user key/secret pair, example: secret='thisisseceret123'
+        :param str host: host url, example: host='http://localhost:8008' (deprecated)
         """
-        if host:
-            Session.default_host = host
+        if api_host:
+            Session.default_host = api_host
+        if web_host:
+            Session.default_web = web_host
+        if files_host:
+            Session.default_files = files_host
         if key:
             Session.default_key = key
         if secret:
             Session.default_secret = secret
+        if host:
+            Session.default_host = host
+            Session.default_web = web_host or ''
+            Session.default_files = files_host or ''
 
     @classmethod
     def _reset_current_task_obj(cls):
@@ -1018,12 +1139,26 @@ class Task(_Task):
             self._arguments.copy_defaults_from_argparse(parser, args=args, namespace=namespace, parsed_args=parsed_args)
 
     def _connect_dictionary(self, dictionary):
+        def _update_args_dict(task, config_dict):
+            task._arguments.copy_from_dict(flatten_dictionary(config_dict))
+
+        def _refresh_args_dict(task, config_dict):
+            # reread from task including newly added keys
+            flat_dict = task._arguments.copy_to_dict(flatten_dictionary(config_dict))
+            nested_dict = config_dict._to_dict()
+            config_dict.clear()
+            config_dict.update(nested_from_flat_dictionary(nested_dict, flat_dict))
+
         self._try_set_connected_parameter_type(self._ConnectedParametersType.dictionary)
 
-        if running_remotely() and self.is_main_task():
-            dictionary = self._arguments.copy_to_dict(dictionary)
+        if not running_remotely():
+            self._arguments.copy_from_dict(flatten_dictionary(dictionary))
+            dictionary = ProxyDictPostWrite(self, _update_args_dict, **dictionary)
         else:
-            dictionary = self._arguments.copy_from_dict(dictionary)
+            flat_dict = flatten_dictionary(dictionary)
+            flat_dict = self._arguments.copy_to_dict(flat_dict)
+            dictionary = nested_from_flat_dictionary(dictionary, flat_dict)
+            dictionary = ProxyDictPostWrite(self, _refresh_args_dict, **dictionary)
 
         return dictionary
 
@@ -1397,7 +1532,7 @@ class Task(_Task):
             cls._get_default_session(),
             tasks.GetAllRequest(
                 project=[project.id],
-                name=exact_match_regex(task_name),
+                name=exact_match_regex(task_name) if task_name else None,
                 only_fields=['id', 'name', 'last_update', system_tags]
             )
         )
@@ -1418,6 +1553,37 @@ class Task(_Task):
             task_id=task.id,
             log_to_backend=False,
         )
+
+    @classmethod
+    def __get_tasks(cls, task_ids=None, project_name=None, task_name=None):
+        if task_ids:
+            if isinstance(task_ids, six.string_types):
+                task_ids = [task_ids]
+            return [cls(private=cls.__create_protection, task_id=i, log_to_backend=False) for i in task_ids]
+
+        if project_name:
+            res = cls._send(
+                cls._get_default_session(),
+                projects.GetAllRequest(
+                    name=exact_match_regex(project_name)
+                )
+            )
+            project = get_single_result(entity='project', query=project_name, results=res.response.projects)
+        else:
+            project = None
+
+        system_tags = 'system_tags' if hasattr(tasks.Task, 'system_tags') else 'tags'
+        res = cls._send(
+            cls._get_default_session(),
+            tasks.GetAllRequest(
+                project=[project.id] if project else None,
+                name=task_name if task_name else None,
+                only_fields=['id', 'name', 'last_update', system_tags]
+            )
+        )
+        res_tasks = res.response.tasks
+
+        return [cls(private=cls.__create_protection, task_id=task.id, log_to_backend=False) for task in res_tasks]
 
     @classmethod
     def __get_hash_key(cls, *args):
@@ -1544,7 +1710,8 @@ class Task(_Task):
 
         # compare after casting to string to avoid enum instance issues
         # remember we might have replaced the api version by now, so enums are different
-        return all(str(server_data) == str(task_data.get(task_data_key)) for server_data, task_data_key in compares)
+        return all(six.text_type(server_data) == six.text_type(task_data.get(task_data_key))
+                   for server_data, task_data_key in compares)
 
     @classmethod
     def __close_timed_out_task(cls, task_data):
