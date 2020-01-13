@@ -24,7 +24,7 @@ from ..setupuploadmixin import SetupUploadMixin
 from ..util import make_message, get_or_create_project, get_single_result, \
     exact_match_regex
 from ...config import get_config_for_bucket, get_remote_task_id, TASK_ID_ENV_VAR, get_log_to_backend, \
-    running_remotely, get_cache_dir
+    running_remotely, get_cache_dir, DOCKER_IMAGE_ENV_VAR
 from ...debugging import get_logger
 from ...debugging.log import LoggerRoot
 from ...storage import StorageHelper
@@ -295,6 +295,10 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     @property
     def project(self):
         return self.data.project
+
+    @property
+    def parent(self):
+        return self.data.parent
 
     @property
     def input_model_id(self):
@@ -667,6 +671,15 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             execution.model_labels = enumeration
             self._edit(execution=execution)
 
+    def _set_default_docker_image(self):
+        if not DOCKER_IMAGE_ENV_VAR.exists():
+            return
+        with self._edit_lock:
+            self.reload()
+            execution = self.data.execution
+            execution.docker_cmd = DOCKER_IMAGE_ENV_VAR.get(default="")
+            self._edit(execution=execution)
+
     def set_artifacts(self, artifacts_list=None):
         """
         List of artifacts (tasks.Artifact) to update the task
@@ -679,8 +692,10 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 and all(isinstance(a, tasks.Artifact) for a in artifacts_list)):
             raise ValueError('Expected artifacts to [tasks.Artifacts]')
         with self._edit_lock:
+            self.reload()
             execution = self.data.execution
-            execution.artifacts = artifacts_list
+            keys = [a.key for a in artifacts_list]
+            execution.artifacts = [a for a in execution.artifacts or [] if a.key not in keys] + artifacts_list
             self._edit(execution=execution)
 
     def _set_model_design(self, design=None):
@@ -860,7 +875,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         execution = ConfigTree.merge_configs(ConfigFactory.from_dict(execution),
                                              ConfigFactory.from_dict(execution_overrides or {}))
         # clear all artifacts
-        execution['artifacts'] = [e for e in execution['artifacts'] if e.get('mode') != 'output']
+        execution['artifacts'] = [e for e in execution['artifacts'] if e.get('mode') == 'input']
 
         if not tags and task.tags:
             tags = [t for t in task.tags if t != cls._development_tag]

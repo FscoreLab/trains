@@ -5,16 +5,20 @@ import sys
 import threading
 import time
 from argparse import ArgumentParser
+from collections import Callable
 from tempfile import mkstemp
 
-from pathlib2 import Path
-from collections import OrderedDict, Callable
+try:
+    from collections.abc import Sequence
+except ImportError:
+    from collections import Sequence
+
 from typing import Optional
 
 import psutil
 import six
+from pathlib2 import Path
 
-from .binding.joblib_bind import PatchedJoblib
 from .backend_api.services import tasks, projects, queues
 from .backend_api.session.session import Session
 from .backend_interface.model import Model as BackendModel
@@ -23,6 +27,14 @@ from .backend_interface.task.args import _Arguments
 from .backend_interface.task.development.worker import DevWorker
 from .backend_interface.task.repo import ScriptInfo
 from .backend_interface.util import get_single_result, exact_match_regex, make_message
+from .binding.absl_bind import PatchAbsl
+from .binding.artifacts import Artifacts, Artifact
+from .binding.environ_bind import EnvironmentBind, PatchOsFork
+from .binding.frameworks.pytorch_bind import PatchPyTorchModelIO
+from .binding.frameworks.tensorflow_bind import TensorflowBinding
+from .binding.frameworks.xgboost_bind import PatchXGBoostModelIO
+from .binding.joblib_bind import PatchedJoblib
+from .binding.matplotlib_bind import PatchedMatplotlib
 from .config import config, PROC_MASTER_ID_ENV_VAR, DEV_TASK_NO_REUSE
 from .config import running_remotely, get_remote_task_id
 from .config.cache import SessionCache
@@ -31,20 +43,13 @@ from .errors import UsageError
 from .logger import Logger
 from .model import InputModel, OutputModel, ARCHIVED_TAG
 from .task_parameters import TaskParameters
-from .binding.artifacts import Artifacts, Artifact
-from .binding.environ_bind import EnvironmentBind, PatchOsFork
-from .binding.absl_bind import PatchAbsl
 from .utilities.args import argparser_parseargs_called, get_argparser_last_args, \
     argparser_update_currenttask
-from .binding.frameworks.pytorch_bind import PatchPyTorchModelIO
-from .binding.frameworks.tensorflow_bind import TensorflowBinding
-from .binding.frameworks.xgboost_bind import PatchXGBoostModelIO
-from .binding.matplotlib_bind import PatchedMatplotlib
-from .utilities.resource_monitor import ResourceMonitor
-from .utilities.seed import make_deterministic
 from .utilities.dicts import ReadOnlyDict
 from .utilities.proxy_object import ProxyDictPreWrite, ProxyDictPostWrite, flatten_dictionary, \
     nested_from_flat_dictionary
+from .utilities.resource_monitor import ResourceMonitor
+from .utilities.seed import make_deterministic
 
 
 class Task(_Task):
@@ -302,6 +307,12 @@ class Task(_Task):
                 if argparser_parseargs_called():
                     parser, parsed_args = get_argparser_last_args()
                     task._connect_argparse(parser=parser, parsed_args=parsed_args)
+            elif argparser_parseargs_called():
+                # parse_args was automatically patched, but auto_connect_arg_parser is False...
+                raise UsageError("ArgumentParser.parse_args() was automatically connected to this task, "
+                                 "although auto_connect_arg_parser is turned off!"
+                                 "When turning off auto_connect_arg_parser, call Task.init() "
+                                 "before calling ArgumentParser.parse_args()")
 
         # Make sure we start the logger, it will patch the main logging object and pipe all output
         # if we are running locally and using development mode worker, we will pipe all stdout to logger.
@@ -424,15 +435,12 @@ class Task(_Task):
 
         :param source_task: Source Task object (or ID) to be cloned
         :type source_task: Task/str
-        :param name: Optional, New for the new task
-        :type name: str
-        :param comment: Optional, comment for the new task
-        :type comment: str
-        :param parent: Optional parent Task ID of the new task.
-        :type parent: str
-        :param project: Optional project ID of the new task.
+        :param str name: Optional, New for the new task
+        :param str comment: Optional, comment for the new task
+        :param str parent: Optional parent Task ID of the new task.
+            If None, parent will be set to source_task.parent, or if not available to source_task itself.
+        :param str project: Optional project ID of the new task.
             If None, the new task will inherit the cloned task's project.
-        :type project: str
         :return: a new cloned Task object
         """
         assert isinstance(source_task, (six.string_types, Task))
@@ -440,6 +448,13 @@ class Task(_Task):
             raise ValueError("Trains-server does not support DevOps features, upgrade trains-server to 0.12.0 or above")
 
         task_id = source_task if isinstance(source_task, six.string_types) else source_task.id
+        if not parent:
+            if isinstance(source_task, six.string_types):
+                source_task = cls.get_task(task_id=source_task)
+            parent = source_task.id if not source_task.parent else source_task.parent
+        elif isinstance(parent, Task):
+            parent = parent.id
+
         cloned_task_id = cls._clone_task(cloned_task_id=task_id, name=name, comment=comment,
                                          parent=parent, project=project)
         cloned_task = cls.get_task(task_id=cloned_task_id)
@@ -527,15 +542,15 @@ class Task(_Task):
         :raise: raise exception on unsupported objects
         """
 
-        dispatch = OrderedDict((
+        dispatch = (
             (OutputModel, self._connect_output_model),
             (InputModel, self._connect_input_model),
             (ArgumentParser, self._connect_argparse),
             (dict, self._connect_dictionary),
             (TaskParameters, self._connect_task_parameters),
-        ))
+        )
 
-        for mutable_type, method in dispatch.items():
+        for mutable_type, method in dispatch:
             if isinstance(mutable, mutable_type):
                 return method(mutable)
 
@@ -573,7 +588,7 @@ class Task(_Task):
             def _update_config_dict(task, config_dict):
                 task.set_model_config(config_dict=config_dict)
 
-            if not running_remotely():
+            if not running_remotely() or not self.is_main_task():
                 self.set_model_config(config_dict=configuration)
                 configuration = ProxyDictPostWrite(self, _update_config_dict, **configuration)
             else:
@@ -583,7 +598,7 @@ class Task(_Task):
             return configuration
 
         # it is a path to a local file
-        if not running_remotely():
+        if not running_remotely() or not self.is_main_task():
             # check if not absolute path
             configuration_path = Path(configuration)
             if not configuration_path.is_file():
@@ -620,7 +635,7 @@ class Task(_Task):
             raise ValueError("connect_label_enumeration supports only `dict` type, "
                              "{} is not supported".format(type(enumeration)))
 
-        if not running_remotely():
+        if not running_remotely() or not self.is_main_task():
             self.set_model_label_enumeration(enumeration)
         else:
             # pop everything
@@ -699,7 +714,7 @@ class Task(_Task):
         if self.is_main_task():
             self.__register_at_exit(None)
 
-    def register_artifact(self, name, artifact, metadata=None):
+    def register_artifact(self, name, artifact, metadata=None, uniqueness_columns=True):
         """
         Add artifact for the current Task, used mostly for Data Audition.
         Currently supported artifacts object types: pandas.DataFrame
@@ -707,8 +722,14 @@ class Task(_Task):
         :param str name: name of the artifacts. Notice! it will override previous artifacts if name already exists.
         :param pandas.DataFrame artifact: artifact object, supported artifacts object types: pandas.DataFrame
         :param dict metadata: dictionary of key value to store with the artifact (visible in the UI)
+        :param Sequence uniqueness_columns: Sequence of columns for artifact uniqueness comparison criteria.
+            The default value is True, which equals to all the columns (same as artifact.columns).
         """
-        self._artifacts_manager.register_artifact(name=name, artifact=artifact, metadata=metadata)
+        if not isinstance(uniqueness_columns, Sequence) and uniqueness_columns is not True:
+            raise ValueError('uniqueness_columns should be a sequence or True')
+        if isinstance(uniqueness_columns, str):
+            uniqueness_columns = [uniqueness_columns]
+        self._artifacts_manager.register_artifact(name=name, artifact=artifact, metadata=metadata, uniqueness_columns=uniqueness_columns)
 
     def unregister_artifact(self, name):
         """
@@ -942,9 +963,12 @@ class Task(_Task):
                         log_to_backend=True,
                     )
                     task_tags = task.data.system_tags if hasattr(task.data, 'system_tags') else task.data.tags
+                    task_artifacts = task.data.execution.artifacts \
+                        if hasattr(task.data.execution, 'artifacts') else None
                     if ((str(task.status) in (str(tasks.TaskStatusEnum.published), str(tasks.TaskStatusEnum.closed)))
                             or task.output_model_id or (ARCHIVED_TAG in task_tags)
-                            or (cls._development_tag not in task_tags)):
+                            or (cls._development_tag not in task_tags)
+                            or task_artifacts):
                         # If the task is published or closed, we shouldn't reset it so we can't use it in dev mode
                         # If the task is archived, or already has an output model,
                         #  we shouldn't use it in development mode either
@@ -983,6 +1007,8 @@ class Task(_Task):
         if in_dev_mode:
             # update this session, for later use
             cls.__update_last_used_task_id(default_project_name, default_task_name, default_task_type.value, task.id)
+            # set default docker image from env.
+            task._set_default_docker_image()
 
         # mark the task as started
         task.started()
@@ -1151,7 +1177,7 @@ class Task(_Task):
 
         self._try_set_connected_parameter_type(self._ConnectedParametersType.dictionary)
 
-        if not running_remotely():
+        if not running_remotely() or not self.is_main_task():
             self._arguments.copy_from_dict(flatten_dictionary(dictionary))
             dictionary = ProxyDictPostWrite(self, _update_args_dict, **dictionary)
         else:

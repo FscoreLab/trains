@@ -2,24 +2,26 @@ import hashlib
 import json
 import mimetypes
 import os
-from zipfile import ZipFile, ZIP_DEFLATED
 from copy import deepcopy
 from datetime import datetime
+from multiprocessing import RLock, Event
 from multiprocessing.pool import ThreadPool
 from tempfile import mkdtemp, mkstemp
 from threading import Thread
-from multiprocessing import RLock, Event
 from time import time
+from zipfile import ZipFile, ZIP_DEFLATED
 
 import humanfriendly
 import six
-from pathlib2 import Path
 from PIL import Image
+from pathlib2 import Path
+from six.moves.urllib.parse import urlparse
 
-from ..backend_interface.metrics.events import UploadEvent
 from ..backend_api import Session
-from ..debugging.log import LoggerRoot
 from ..backend_api.services import tasks
+from ..backend_interface.metrics.events import UploadEvent
+from ..debugging.log import LoggerRoot
+from ..storage.helper import remote_driver_schemes
 
 try:
     import pandas as pd
@@ -204,6 +206,8 @@ class Artifacts(object):
             self._artifacts_manager = artifacts_manager
             # list of artifacts we should not upload (by name & weak-reference)
             self.artifact_metadata = {}
+            # list of hash columns to calculate uniqueness for the artifacts
+            self.artifact_hash_columns = {}
 
         def __setitem__(self, key, value):
             # check that value is of type pandas
@@ -225,9 +229,15 @@ class Artifacts(object):
         def get_metadata(self, name):
             return self.artifact_metadata.get(name)
 
+        def add_hash_columns(self, artifact_name, hash_columns):
+            self.artifact_hash_columns[artifact_name] = hash_columns
+
+        def get_hash_columns(self, artifact_name):
+            return self.artifact_hash_columns.get(artifact_name)
+
     @property
     def registered_artifacts(self):
-        return self._artifacts_dict
+        return self._artifacts_container
 
     @property
     def summary(self):
@@ -237,26 +247,33 @@ class Artifacts(object):
         self._task = task
         # notice the double link, this important since the Artifact
         # dictionary needs to signal the Artifacts base on changes
-        self._artifacts_dict = self._ProxyDictWrite(self)
+        self._artifacts_container = self._ProxyDictWrite(self)
         self._last_artifacts_upload = {}
         self._unregister_request = set()
         self._thread = None
         self._flush_event = Event()
         self._exit_flag = False
-        self._thread_pool = ThreadPool()
         self._summary = ''
         self._temp_folder = []
         self._task_artifact_list = []
         self._task_edit_lock = RLock()
         self._storage_prefix = None
 
-    def register_artifact(self, name, artifact, metadata=None):
+    def register_artifact(self, name, artifact, metadata=None, uniqueness_columns=True):
+        """
+        :param str name: name of the artifacts. Notice! it will override previous artifacts if name already exists.
+        :param pandas.DataFrame artifact: artifact object, supported artifacts object types: pandas.DataFrame
+        :param dict metadata: dictionary of key value to store with the artifact (visible in the UI)
+        :param list uniqueness_columns: list of columns for artifact uniqueness comparison criteria. The default value
+            is True, which equals to all the columns (same as artifact.columns).
+        """
         # currently we support pandas.DataFrame (which we will upload as csv.gz)
-        if name in self._artifacts_dict:
+        if name in self._artifacts_container:
             LoggerRoot.get_base_logger().info('Register artifact, overwriting existing artifact \"{}\"'.format(name))
-        self._artifacts_dict[name] = artifact
+        self._artifacts_container.add_hash_columns(name, list(artifact.columns if uniqueness_columns is True else uniqueness_columns))
+        self._artifacts_container[name] = artifact
         if metadata:
-            self._artifacts_dict.add_metadata(name, metadata)
+            self._artifacts_container.add_metadata(name, metadata)
 
     def unregister_artifact(self, name):
         # Remove artifact from the watch list
@@ -269,12 +286,13 @@ class Artifacts(object):
                                                  'please upgrade to the latest server version')
             return False
 
-        if name in self._artifacts_dict:
+        if name in self._artifacts_container:
             raise ValueError("Artifact by the name of {} is already registered, use register_artifact".format(name))
 
         artifact_type_data = tasks.ArtifactTypeData()
         override_filename_in_uri = None
         override_filename_ext_in_uri = None
+        uri = None
         if np and isinstance(artifact_object, np.ndarray):
             artifact_type = 'numpy'
             artifact_type_data.content_type = 'application/numpy'
@@ -317,10 +335,15 @@ class Artifacts(object):
             os.close(fd)
             artifact_type_data.preview = preview
             delete_after_upload = True
-        elif isinstance(artifact_object, six.string_types) or isinstance(artifact_object, Path):
+        elif isinstance(artifact_object, six.string_types) and urlparse(artifact_object).scheme in remote_driver_schemes:
+            # we should not upload this, just register
+            local_filename = None
+            uri = artifact_object
+            artifact_type = 'custom'
+            artifact_type_data.content_type = mimetypes.guess_type(artifact_object)[0]
+        elif isinstance(artifact_object, six.string_types + (Path,)):
             # check if single file
-            if isinstance(artifact_object, six.string_types):
-                artifact_object = Path(artifact_object)
+            artifact_object = Path(artifact_object)
 
             artifact_object.expanduser().absolute()
             try:
@@ -389,21 +412,26 @@ class Artifacts(object):
                 self._task_artifact_list.remove(artifact)
                 break
 
-        # check that the file to upload exists
-        local_filename = Path(local_filename).absolute()
-        if not local_filename.exists() or not local_filename.is_file():
-            LoggerRoot.get_base_logger().warning('Artifact upload failed, cannot find file {}'.format(
-                local_filename.as_posix()))
-            return False
+        if not local_filename:
+            file_size = None
+            file_hash = None
+        else:
+            # check that the file to upload exists
+            local_filename = Path(local_filename).absolute()
+            if not local_filename.exists() or not local_filename.is_file():
+                LoggerRoot.get_base_logger().warning('Artifact upload failed, cannot find file {}'.format(
+                    local_filename.as_posix()))
+                return False
 
-        file_hash, _ = self.sha256sum(local_filename.as_posix())
+            file_hash, _ = self.sha256sum(local_filename.as_posix())
+            file_size = local_filename.stat().st_size
+
+            uri = self._upload_local_file(local_filename, name,
+                                          delete_after_upload=delete_after_upload,
+                                          override_filename=override_filename_in_uri,
+                                          override_filename_ext=override_filename_ext_in_uri)
+
         timestamp = int(time())
-        file_size = local_filename.stat().st_size
-
-        uri = self._upload_local_file(local_filename, name,
-                                      delete_after_upload=delete_after_upload,
-                                      override_filename=override_filename_in_uri,
-                                      override_filename_ext=override_filename_ext_in_uri)
 
         artifact = tasks.Artifact(key=name, type=artifact_type,
                                   uri=uri,
@@ -442,7 +470,8 @@ class Artifacts(object):
                     pass
 
     def _start(self):
-        if not self._thread:
+        """ Start daemon thread if any artifacts are registered and thread is not up yet """
+        if not self._thread and self._artifacts_container:
             # start the daemon thread
             self._flush_event.clear()
             self._thread = Thread(target=self._daemon)
@@ -453,7 +482,7 @@ class Artifacts(object):
         while not self._exit_flag:
             self._flush_event.wait(self._flush_frequency_sec)
             self._flush_event.clear()
-            artifact_keys = list(self._artifacts_dict.keys())
+            artifact_keys = list(self._artifacts_container.keys())
             for name in artifact_keys:
                 try:
                     self._upload_data_audit_artifacts(name)
@@ -465,8 +494,8 @@ class Artifacts(object):
 
     def _upload_data_audit_artifacts(self, name):
         logger = self._task.get_logger()
-        pd_artifact = self._artifacts_dict.get(name)
-        pd_metadata = self._artifacts_dict.get_metadata(name)
+        pd_artifact = self._artifacts_container.get(name)
+        pd_metadata = self._artifacts_container.get_metadata(name)
 
         # remove from artifacts watch list
         if name in self._unregister_request:
@@ -474,7 +503,7 @@ class Artifacts(object):
                 self._unregister_request.remove(name)
             except KeyError:
                 pass
-            self._artifacts_dict.unregister_artifact(name)
+            self._artifacts_container.unregister_artifact(name)
 
         if pd_artifact is None:
             return
@@ -563,15 +592,38 @@ class Artifacts(object):
 
     def _get_statistics(self, artifacts_dict=None):
         summary = ''
-        artifacts_dict = artifacts_dict or self._artifacts_dict
+        artifacts_dict = artifacts_dict or self._artifacts_container
         thread_pool = ThreadPool()
 
         try:
             # build hash row sets
             artifacts_summary = []
             for a_name, a_df in artifacts_dict.items():
+                hash_cols = self._artifacts_container.get_hash_columns(a_name)
                 if not pd or not isinstance(a_df, pd.DataFrame):
                     continue
+
+                if hash_cols is True:
+                    hash_col_drop = []
+                else:
+                    hash_cols = set(hash_cols)
+                    missing_cols = hash_cols.difference(a_df.columns)
+                    if missing_cols == hash_cols:
+                        LoggerRoot.get_base_logger().warning(
+                            'Uniqueness columns {} not found in artifact {}. '
+                            'Skipping uniqueness check for artifact.'.format(list(missing_cols), a_name)
+                        )
+                        continue
+                    elif missing_cols:
+                        # missing_cols must be a subset of hash_cols
+                        hash_cols.difference_update(missing_cols)
+                        LoggerRoot.get_base_logger().warning(
+                            'Uniqueness columns {} not found in artifact {}. Using {}.'.format(
+                                list(missing_cols), a_name, list(hash_cols)
+                            )
+                        )
+
+                    hash_col_drop = [col for col in a_df.columns if col not in hash_cols]
 
                 a_unique_hash = set()
 
@@ -580,7 +632,8 @@ class Artifacts(object):
 
                 a_shape = a_df.shape
                 # parallelize
-                thread_pool.map(hash_row, a_df.values)
+                a_hash_cols = a_df.drop(columns=hash_col_drop)
+                thread_pool.map(hash_row, a_hash_cols.values)
                 # add result
                 artifacts_summary.append((a_name, a_shape, a_unique_hash,))
 

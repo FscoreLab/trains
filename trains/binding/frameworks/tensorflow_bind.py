@@ -1026,11 +1026,15 @@ class PatchTensorFlowEager(object):
             event_writer._add_histogram(tag=tag, step=step, histo_data=hist_data)
             return
 
-        # prepare the dictionary, assume numpy
-        # histo_data['bucketLimit'] is the histogram bucket right side limit, meaning X axis
-        # histo_data['bucket'] is the histogram height, meaning the Y axis
-        # notice hist_data[:, 1] is the right side limit, for backwards compatibility we take the left side
-        histo_data = {'bucketLimit': hist_data[:, 0].tolist(), 'bucket': hist_data[:, 2].tolist()}
+        if isinstance(hist_data, np.ndarray):
+            hist_data = np.histogram(hist_data)
+            histo_data = {'bucketLimit': hist_data[1].tolist(), 'bucket': hist_data[0].tolist()}
+        else:
+            # prepare the dictionary, assume numpy
+            # histo_data['bucketLimit'] is the histogram bucket right side limit, meaning X axis
+            # histo_data['bucket'] is the histogram height, meaning the Y axis
+            # notice hist_data[:, 1] is the right side limit, for backwards compatibility we take the left side
+            histo_data = {'bucketLimit': hist_data[:, 0].tolist(), 'bucket': hist_data[:, 2].tolist()}
         event_writer._add_histogram(tag=tag, step=step, histo_data=histo_data)
 
     @staticmethod
@@ -1279,7 +1283,11 @@ class PatchKerasModelIO(object):
             filepath = kwargs['filepath'] if 'filepath' in kwargs else args[0]
 
             # this will already generate an output model
-            config = self._updated_config()
+            try:
+                config = self._updated_config()
+            except Exception as ex:
+                # we failed to convert the network to json, for some reason (most likely internal keras error)
+                config = {}
 
             # check if object already has InputModel
             if not hasattr(self, 'trains_out_model'):
