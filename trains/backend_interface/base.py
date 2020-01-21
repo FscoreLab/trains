@@ -3,12 +3,11 @@ import abc
 import requests.exceptions
 import six
 
-from ..backend_api import Session, CallResult
-from ..backend_api.session.session import MaxRequestSizeError
-from ..backend_api.session.response import ResponseMeta
+from ..backend_api import CallResult, Session
 from ..backend_api.session import BatchRequest
 from ..backend_api.session.defs import ENV_ACCESS_KEY, ENV_SECRET_KEY
-
+from ..backend_api.session.response import ResponseMeta
+from ..backend_api.session.session import MaxRequestSizeError
 from ..config import config_obj
 from ..config.defs import LOG_LEVEL_ENV_VAR
 from ..debugging import get_logger
